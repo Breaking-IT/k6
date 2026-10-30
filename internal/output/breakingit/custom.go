@@ -29,7 +29,6 @@ type customGroupKey struct {
 }
 
 type CustomOutput struct {
-	browserMode     bool
 	groups          map[customGroupKey]*MetricGroup
 	groupTickets    map[customGroupKey]*metrics.RequestTicket
 	tracker         *metrics.RequestTracker
@@ -118,11 +117,6 @@ func NewCustom(params output.Params) (output.Output, error) {
 		retryTimeout: 30 * time.Second, queue: make(chan customBatch, 4), done: make(chan struct{}),
 		tickStop: make(chan struct{}), tickDone: make(chan struct{}), failed: make(chan struct{}), parts: map[string]*bytes.Buffer{},
 	}
-	for _, scenario := range params.ScriptOptions.Scenarios {
-		if opts := scenario.GetScenarioOptions(); opts != nil && len(opts.Browser) > 0 {
-			c.browserMode = true
-		}
-	}
 	c.groups = map[customGroupKey]*MetricGroup{}
 	c.groupTickets = map[customGroupKey]*metrics.RequestTicket{}
 	c.mapper = &Logger{out: params.StdOut, envTags: tags, customPatterns: patterns, transactionSource: source,
@@ -130,8 +124,6 @@ func NewCustom(params output.Params) (output.Output, error) {
 		pendingHttpGroups: map[int64]*MetricGroup{}, rowSink: c.addRow}
 	return c, nil
 }
-
-func (c *CustomOutput) UsesRequestTracking() bool { return !c.browserMode }
 
 func (c *CustomOutput) SetRequestTracker(t *metrics.RequestTracker) { c.tracker = t }
 
@@ -186,7 +178,7 @@ func (c *CustomOutput) Start() error {
 			}
 			return err
 		}
-		encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+		encoder, err := newCustomEncoder()
 		if err != nil {
 			return err
 		}
@@ -490,4 +482,10 @@ func (c *CustomOutput) request(path string, body []byte, contentType string, seq
 		case <-timer.C:
 		}
 	}
+}
+
+// The storage ingress caps zstd decoder windows at 2^18 bytes, independently
+// of the larger decoded batch budget. Enforce this even on full 2 MiB batches.
+func newCustomEncoder() (*zstd.Encoder, error) {
+	return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(1<<18))
 }

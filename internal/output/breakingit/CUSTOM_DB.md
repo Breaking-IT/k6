@@ -60,16 +60,16 @@ Generator machine statistics remain the responsibility of the existing agent.
 - Drain accepted sample containers and all queued requests before `/finish`.
   The producer does not seal the run itself. A final barrier proves delivery of
   this producer's data; it is not a durable-on-disk/fsync acknowledgement.
-- A fresh producer source is required at startup. Native runs recover after a
+- A fresh producer source is required at startup. Tracked native and browser runs recover after a
   server incarnation change using the anchored source clock and checkpoint sequence:
   skip a held batch proven checkpointed; otherwise renumber and replay only that
   unacknowledged batch. Previously acknowledged, lost rows are not replayed; the
   service exposes its relaxed-durability coverage gaps. Same-incarnation conflicts
-  remain fatal. Browser runs without a proven source clock fail closed on restart.
+  remain fatal.
 
 ## Watermarks and unsupported data
 
-Native k6 runs send live request watermarks, using the same sequence-backed,
+Native and browser k6 runs send live request watermarks, using the same sequence-backed,
 all-source barrier as the Java writer. The output manager installs a per-run
 tracker before producers start. HTTP completion assigns its timestamp and pin
 atomically; WebSocket connecting/ping and custom metrics are similarly tracked.
@@ -84,13 +84,19 @@ seconds remain queryable through the pending/raw path. Event-time completeness
 still does not imply fsync durability. Transactions and monitoring are separate
 streams, just as in the Java request-watermark contract.
 
-**Browser scenarios are not yet at watermark parity.** Their request timestamps
-come from asynchronous Chromium/CDP events in another process. They retain the
-previous grace/pending/raw path, including mixed browser/native scenarios; a host
-wall-clock timer cannot prove their event-time completeness. Browser timestamps
-are not rewritten to manufacture progress. Browser live barriers require a
-separate CDP lifecycle contract. Uninstrumented native request metric producers
-fail closed rather than silently violating a watermark.
+Browser requests acquire a completion pin when the generator dispatches the
+terminal CDP event (including redirects and loading failures), before deferred
+header/body retrieval. They emit one complete timing/failure bundle. The pin
+survives deferred work and the output queue; skipped cached requests release it.
+Mixed browser/native scenarios use the same tracker and lane barriers.
+
+**Timestamp contract:** browser sampler timestamps now mean generator-observed
+terminal CDP completion, for both Custom DB and TimescaleDB outputs. Previously,
+successful rows used the response-header timestamp. Chromium phase/duration
+measurements remain in their original time base. CDP transport delay precedes
+this observation; this is not a claim that Chromium's original event clock is
+watermarked. Nothing is retimestamped at output delivery to hide writer backlog.
+Uninstrumented request metric producers fail closed.
 
 Synthetic monitoring and browser screenshots are explicitly unsupported and
 rejected. Ordinary browser request timings, failure response data, native groups
@@ -122,3 +128,9 @@ The live smoke test also requires unfinished sources with advancing watermarks a
 complete aggregate buckets before finalization. Crash mode kills only its own
 throwaway service, verifies retained rows against the oracle without duplicates,
 and requires explicit incomplete coverage whenever rows were lost.
+
+Browser validation also runs real Chromium with redirects, iframe requests,
+connection failure, caching and a delayed 503 response, comparing both writers
+on the same stream. Use `--browser --container-image IMAGE` with a Linux binary
+and an image containing Chromium. This mapping oracle is distinct from the
+actual-database high-load benchmark in the BreakTest integration repository.

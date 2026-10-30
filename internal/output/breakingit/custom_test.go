@@ -461,3 +461,20 @@ func TestUntrackedRequestCannotCrossNativeWatermark(t *testing.T) {
 	require.ErrorContains(t, c.err(), "lacks producer completion tracking")
 	require.Empty(t, c.parts)
 }
+
+func TestCustomFullBatchRespectsStorageDecoderWindow(t *testing.T) {
+	encoder, err := newCustomEncoder()
+	require.NoError(t, err)
+	defer encoder.Close()
+	plain := bytes.Repeat([]byte("large-request-metric-row\n"), 100000)
+	encoded := encoder.EncodeAll(plain, nil)
+	var header zstd.Header
+	require.NoError(t, header.Decode(encoded))
+	require.LessOrEqual(t, header.WindowSize, uint64(1<<18))
+	decoder, err := zstd.NewReader(nil, zstd.WithDecoderMaxWindow(1<<18))
+	require.NoError(t, err)
+	defer decoder.Close()
+	decoded, err := decoder.DecodeAll(encoded, nil)
+	require.NoError(t, err)
+	require.Equal(t, plain, decoded)
+}

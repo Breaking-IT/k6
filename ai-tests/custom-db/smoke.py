@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import html
 import subprocess
 import tempfile
 import threading
@@ -36,9 +37,19 @@ def run(args):
             pass
 
         def do_GET(self):
-            self.send_response(503 if self.path == "/failure" else 200)
+            if self.path == '/redirect':
+                self.send_response(302);self.send_header('Location','/ok');self.end_headers();return
+            if self.path == '/reset':
+                self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
+            body=b'<html><body>fixture<iframe src="/frame"></iframe></body></html>' if self.path=='/page' else b'fixture response'
+            self.send_response(503 if self.path in ('/failure','/slowfailure') else 200)
+            self.send_header('Content-Type','text/html')
+            self.send_header('Content-Length',str(len(body)))
+            self.send_header('Cache-Control','max-age=3600' if self.path=='/cached' else 'no-store')
             self.end_headers()
-            self.wfile.write(b"fixture response")
+            if self.path=='/slowfailure':
+                self.wfile.write(body[:3]);self.wfile.flush();time.sleep(1.2);body=body[3:]
+            self.wfile.write(body)
 
         def do_POST(self):
             if self.path != "/ingest/batch":
@@ -109,6 +120,23 @@ export default function () {
   sleep(0.15);
 }
 ''')
+            if args.browser:
+                script.write_text("""import { browser } from 'k6/browser';
+import { group, check, sleep } from 'k6';
+export const options = { scenarios: { browser: {executor:'per-vu-iterations',vus:1,iterations:Number(__ENV.FIXTURE_ITERATIONS),options:{browser:{type:'chromium'}}} } };
+export default async function(){
+ const page=await browser.newPage();
+ try { await group('Checkout',async function(){
+  await page.goto(__ENV.TARGET+'/page');
+  const status=await page.evaluate(async()=>{
+   await fetch('/redirect');await fetch('/cached');await fetch('/cached');
+   try {await fetch('/reset')}catch(e){}
+   return (await fetch('/slowfailure').then(async r=>{await r.text();return r.status}));
+  });
+  check(status,{'expected failure': s=>s===200});
+ }); sleep(.3); } finally {await page.close();}
+}
+""")
             target_url = f"http://127.0.0.1:{target.server_port}"
             writer_env = {**os.environ, "CUSTOM_STORAGE_TOKEN": producer, "runId": "k6-smoke",
                 "nodeName": "k6-probe", "location": "Local", "PG_PROXY_TOKEN": "isolated-oracle",
@@ -118,6 +146,16 @@ export default function () {
             command = [str(Path(args.k6).resolve()), "run", "--quiet",
                 "--out", "custom-db-breakingit=" + service,
                 "--out", "timescaledb-breakingit=" + target_url, str(script)]
+            if args.container_image:
+                root.chmod(0o755); script.chmod(0o644)
+                for key in ('TARGET',): writer_env[key]=writer_env[key].replace('127.0.0.1','host.docker.internal')
+                command=['docker','run','--rm','--shm-size','512m','--entrypoint','/usr/bin/k6',
+                    '-v',str(Path(args.k6).resolve())+':/usr/bin/k6:ro','-v',str(script)+':/fixture.js:ro',
+                    '-e','K6_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium','-e','K6_BROWSER_ARGS=no-sandbox',
+                    '-e','K6_BROWSER_HEADLESS=true',
+                    *[item for key in ('CUSTOM_STORAGE_TOKEN','runId','nodeName','location','PG_PROXY_TOKEN','TARGET','K6_NO_USAGE_REPORT','K6_HTTP_ERROR_DATA','FIXTURE_ITERATIONS','FIXTURE_CUSTOM') for item in ('-e',key)],
+                    args.container_image,'run','--quiet','--out','custom-db-breakingit='+service.replace('127.0.0.1','host.docker.internal'),
+                    '--out','timescaledb-breakingit='+target_url.replace('127.0.0.1','host.docker.internal'),'/fixture.js']
             observations=[]
             with (root/'k6.log').open('w+') as log:
                 process=subprocess.Popen(command,env=writer_env,text=True,stdout=log,stderr=log)
@@ -156,7 +194,7 @@ export default function () {
                 counts[table] = len(actual["rows"])
                 if not args.restart_live: assert counts[table] == len(oracle[table]), (table, counts[table], len(oracle[table]))
                 else: assert counts[table] <= len(oracle[table]), (table, counts)
-                if table in expected_counts and not args.restart_live:
+                if table in expected_counts and not args.restart_live and not args.browser:
                     assert counts[table] == expected_counts[table], (table, counts)
                 else:
                     assert counts[table] > 0
@@ -195,7 +233,7 @@ export default function () {
             for table, count in counts.items():
                 actual = post("/runs/k6-smoke/query", {"table": table, "start_us": origin, "end_us": end})
                 assert len(actual["rows"]) == count
-            print(json.dumps({"status": "passed", "counts": counts, "lanes":args.lanes, "live_watermark_observations":len(live), "crash_recovery":args.restart_live, "coverage_gaps":final["gaps"], "parity": "retained rows are a duplicate-free subset of oracle" if args.restart_live else "all columns except generated error UUIDs", "sealed": True, "restart_reads": True}, indent=2))
+            print(json.dumps({"status": "passed", "counts": counts, "lanes":args.lanes, "live_watermark_observations":len(live), "crash_recovery":args.restart_live, "browser":args.browser, "coverage_gaps":final["gaps"], "parity": "retained rows are a duplicate-free subset of oracle" if args.restart_live else "all columns except generated error UUIDs", "sealed": True, "restart_reads": True}, indent=2))
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
             target.shutdown()
@@ -209,4 +247,6 @@ if __name__ == "__main__":
     parser.add_argument('--iterations',type=int,default=80)
     parser.add_argument('--restart-live',action='store_true')
     parser.add_argument('--custom-metrics',action='store_true')
+    parser.add_argument('--browser',action='store_true')
+    parser.add_argument('--container-image')
     run(parser.parse_args())

@@ -311,7 +311,7 @@ func TestNetworkManagerEmitRequestResponseMetricsTimingSkew(t *testing.T) {
 				&network.Response{Timing: &network.ResourceTiming{}},
 				(*cdp.MonotonicTime)(&tt.res.ts),
 			)
-			nm.emitResponseMetrics(res, req)
+			nm.emitResponseMetrics(res, req, browserCompletion{at: tt.wantRes.wt})
 			n = vu.AssertSamples(func(s k6metrics.Sample) {
 				assert.Equalf(t, tt.wantRes.wt, s.Time, "timing skew in %s", s.Metric.Name)
 			})
@@ -363,7 +363,7 @@ func TestNetworkManagerMetricsRetainRequestTagsAndMetadata(t *testing.T) {
 		URL:    req.URL(),
 		Timing: &network.ResourceTiming{},
 	}, (*cdp.MonotonicTime)(&now))
-	nm.emitResponseMetrics(resp, req)
+	nm.emitResponseMetrics(resp, req, nm.beginBrowserCompletion())
 
 	n := vu.AssertSamples(func(sample k6metrics.Sample) {
 		group, ok := sample.Tags.Get(k6metrics.TagGroup.String())
@@ -379,7 +379,7 @@ func TestNetworkManagerMetricsRetainRequestTagsAndMetadata(t *testing.T) {
 	// The fork also emits samples when navigation fails before any response.
 	// Those must use the request's context, not the VU's restored context.
 	req.setErrorText("net::ERR_CONNECTION_REFUSED")
-	nm.emitRequestFailedMetrics(req)
+	nm.emitRequestFailedMetrics(req, nm.beginBrowserCompletion())
 	n = vu.AssertSamples(func(sample k6metrics.Sample) {
 		group, _ := sample.Tags.Get(k6metrics.TagGroup.String())
 		assert.Equal(t, "::request", group)
@@ -621,7 +621,7 @@ func TestNetworkManagerReceivingMetric(t *testing.T) {
 		},
 		(*cdp.MonotonicTime)(&reqTimestamp),
 	)
-	nm.emitResponseMetrics(resp, req)
+	nm.emitResponseMetrics(resp, req, nm.beginBrowserCompletion())
 
 	var receivingVal float64
 	vu.AssertSamples(func(s k6metrics.Sample) {
@@ -687,7 +687,7 @@ func TestNetworkManagerReceivingMetricNoHeadersEndWall(t *testing.T) {
 		},
 		(*cdp.MonotonicTime)(&reqTimestamp),
 	)
-	nm.emitResponseMetrics(resp, req)
+	nm.emitResponseMetrics(resp, req, nm.beginBrowserCompletion())
 
 	var receivingVal float64
 	vu.AssertSamples(func(s k6metrics.Sample) {
@@ -751,7 +751,7 @@ func TestNetworkManagerReceivingMetricCachedResponse(t *testing.T) {
 		},
 		(*cdp.MonotonicTime)(&reqTimestamp),
 	)
-	nm.emitResponseMetrics(resp, req)
+	nm.emitResponseMetrics(resp, req, nm.beginBrowserCompletion())
 
 	var receivingVal float64
 	receivingFound := false
