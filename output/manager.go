@@ -1,6 +1,7 @@
 package output
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -40,7 +41,25 @@ func NewManager(outputs []Output, logger logrus.FieldLogger, testStopCallback fu
 // all of its buffered metrics have been sent to all outputs. The second
 // callback will call the Stop() or StopWithTestError() method of every output.
 func (om *Manager) Start(samplesChan chan metrics.SampleContainer) (wait func(), finish func(error), err error) {
+	var unbind func()
+	for _, out := range om.outputs {
+		if tracked, ok := out.(interface{ SetRequestTracker(*metrics.RequestTracker) }); ok {
+			if mode, ok := out.(interface{ UsesRequestTracking() bool }); ok && !mode.UsesRequestTracking() {
+				continue
+			}
+			if unbind != nil {
+				unbind()
+				return nil, nil, fmt.Errorf("only one request-tracked output is supported")
+			}
+			tracker, release := metrics.BindRequestTracker(samplesChan)
+			unbind = release
+			tracked.SetRequestTracker(tracker)
+		}
+	}
 	if err := om.startOutputs(); err != nil {
+		if unbind != nil {
+			unbind()
+		}
 		return nil, nil, err
 	}
 
@@ -78,6 +97,9 @@ func (om *Manager) Start(samplesChan chan metrics.SampleContainer) (wait func(),
 	finish = func(testErr error) {
 		wait() // just in case, though it shouldn't be needed if API is used correctly
 		om.stopOutputs(testErr, len(om.outputs))
+		if unbind != nil {
+			unbind()
+		}
 	}
 	return wait, finish, nil
 }

@@ -115,16 +115,17 @@ func (m Metric) add(v sobek.Value, addTags sobek.Value) (bool, error) {
 		return false, fmt.Errorf("cannot add tags for the '%s' custom metric: %w", m.metric.Name, err)
 	}
 
+	ticket := metrics.BeginRequest(state.Samples)
 	sample := metrics.Sample{
 		TimeSeries: metrics.TimeSeries{
 			Metric: m.metric,
 			Tags:   ctm.Tags,
 		},
-		Time:     time.Now(),
+		Time:     metrics.RequestTime(ticket, time.Now()),
 		Metadata: ctm.Metadata,
 		Value:    vfloat,
 	}
-	metrics.PushIfNotDone(m.vu.Context(), state.Samples, sample)
+	metrics.PushTrackedRequest(m.vu.Context(), state.Samples, ticket, sample)
 	return true, nil
 }
 

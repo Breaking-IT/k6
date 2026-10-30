@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
@@ -312,4 +313,151 @@ func TestCustomHTTPDuplicateIdentityFails(t *testing.T) {
 	sample := transactionTestSample("http_req_duration", nil, false)
 	c.AddMetricSamples([]metrics.SampleContainer{sample, sample})
 	require.ErrorContains(t, c.err(), "ambiguous HTTP metric identity")
+}
+
+func TestCustomWatermarkWaitsForEveryLaneAndPendingProducer(t *testing.T) {
+	var mu sync.Mutex
+	sequences := map[string]uint64{}
+	watermarks := map[string]int64{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		token := r.Header.Get("Authorization")
+		seq, _ := strconv.ParseUint(r.Header.Get("X-Sequence"), 10, 64)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/hello"):
+			fmt.Fprint(w, `{"incarnation":"one","accepted_sequence":0}`)
+		case strings.HasSuffix(r.URL.Path, "/ingest/batch"):
+			require.Equal(t, sequences[token]+1, seq)
+			sequences[token] = seq
+			fmt.Fprintf(w, `{"accepted":%d}`, seq)
+		case strings.HasSuffix(r.URL.Path, "/watermark"):
+			var body struct {
+				Before int64 `json:"before_us"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			require.Equal(t, sequences[token], seq)
+			watermarks[token] = body.Before
+			fmt.Fprintf(w, `{"accepted_sequence":%d,"watermark_us":%d}`, seq, body.Before)
+		case strings.HasSuffix(r.URL.Path, "/finish"):
+			require.Equal(t, sequences[token], seq)
+			fmt.Fprintf(w, `{"accepted_sequence":%d,"finished":true}`, seq)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer server.Close()
+	c := newCustomTest(t, server.URL)
+	c.tokens = []string{"producer-token", "second"}
+	ch := make(chan metrics.SampleContainer, 1)
+	tracker, release := metrics.BindRequestTracker(ch)
+	defer release()
+	c.SetRequestTracker(tracker)
+	require.NoError(t, c.Start())
+	ticket := metrics.BeginRequest(ch) // Request not delivered to the output yet.
+	pin := ticket.Time.Truncate(time.Second).UnixMicro() - pgEpochSeconds*1_000_000
+	for range 4 {
+		c.AddMetricSamples([]metrics.SampleContainer{transactionTestSample("group_duration", nil, false)})
+		c.flush()
+	}
+	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(watermarks) == 2 }, 2*time.Second, 10*time.Millisecond)
+	mu.Lock()
+	for _, watermark := range watermarks {
+		require.LessOrEqual(t, watermark, pin)
+	}
+	mu.Unlock()
+	// Cancellation before enqueue may release its pin; no request row exists.
+	ticket.Release()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return watermarks["Bearer producer-token"] > pin && watermarks["Bearer second"] > pin
+	}, 2*time.Second, 10*time.Millisecond)
+	require.NoError(t, c.Stop())
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, uint64(2), sequences["Bearer producer-token"])
+	require.Equal(t, uint64(2), sequences["Bearer second"])
+}
+
+func TestCustomRecoveryReplaysOnlyUnacknowledgedBatch(t *testing.T) {
+	for _, checkpoint := range []uint64{0, 2} {
+		t.Run(strconv.Itoa(int(checkpoint)), func(t *testing.T) {
+			calls := 0
+			var first []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/hello") {
+					fmt.Fprintf(w, `{"incarnation":"new","accepted_sequence":%d,"checkpoint_sequence":%d}`, checkpoint, checkpoint)
+					return
+				}
+				calls++
+				body, _ := io.ReadAll(r.Body)
+				if calls == 1 {
+					first = body
+					require.Equal(t, "old", r.Header.Get("X-Incarnation"))
+					require.Equal(t, "2", r.Header.Get("X-Sequence"))
+					w.WriteHeader(409)
+					return
+				}
+				require.Equal(t, first, body)
+				require.Equal(t, "new", r.Header.Get("X-Incarnation"))
+				require.Equal(t, "1", r.Header.Get("X-Sequence"))
+				fmt.Fprint(w, `{"accepted":1}`)
+			}))
+			defer server.Close()
+			c := newCustomTest(t, server.URL)
+			ch := make(chan metrics.SampleContainer)
+			tracker, release := metrics.BindRequestTracker(ch)
+			defer release()
+			c.tracker = tracker
+			c.sequence = 1
+			c.incarnation = "old"
+			require.NoError(t, c.sendBatch([]byte("identical-compressed-body"), "multipart/mixed"))
+			if checkpoint == 0 {
+				require.Equal(t, 2, calls)
+				require.Equal(t, uint64(1), c.sequence)
+			} else {
+				require.Equal(t, 1, calls)
+				require.Equal(t, uint64(2), c.sequence)
+			}
+		})
+	}
+}
+
+func TestTrackedHTTPJoinKeepsPinUntilFailureMetric(t *testing.T) {
+	c := newCustomTest(t, "http://localhost")
+	channel := make(chan metrics.SampleContainer)
+	tracker, release := metrics.BindRequestTracker(channel)
+	defer release()
+	c.tracker = tracker
+	ticket := metrics.BeginRequest(channel)
+	reg := metrics.NewRegistry()
+	tags := reg.RootTagSet().With("name", "/tracked")
+	names := []string{"http_req_duration", "http_req_blocked", "http_req_connecting", "http_req_tls_handshaking", "http_req_sending", "http_req_waiting", "http_req_receiving"}
+	samples := metrics.Samples{}
+	for _, name := range names {
+		samples = append(samples, metrics.Sample{TimeSeries: metrics.TimeSeries{Metric: reg.MustNewMetric(name, metrics.Trend), Tags: tags}, Time: ticket.Time, Value: 12})
+	}
+	c.AddMetricSamples([]metrics.SampleContainer{metrics.RequestSamples{SampleContainer: samples, Ticket: ticket}})
+	require.Len(t, c.groups, 1)
+	require.Len(t, c.groupTickets, 1)
+	require.False(t, tracker.Before().After(ticket.Time))
+	failed := metrics.Sample{TimeSeries: metrics.TimeSeries{Metric: reg.MustNewMetric("http_req_failed", metrics.Rate), Tags: tags}, Time: ticket.Time, Value: 1, HTTPErrorResBody: "delayed failure"}
+	c.AddMetricSamples([]metrics.SampleContainer{metrics.RequestSamples{SampleContainer: failed, Ticket: ticket}})
+	require.Empty(t, c.groups)
+	require.Empty(t, c.groupTickets)
+	require.NoError(t, c.err())
+	require.NotNil(t, c.parts["requests_raw"])
+	require.NotNil(t, c.parts["requests_error"])
+}
+
+func TestUntrackedRequestCannotCrossNativeWatermark(t *testing.T) {
+	c := newCustomTest(t, "http://localhost")
+	channel := make(chan metrics.SampleContainer)
+	tracker, release := metrics.BindRequestTracker(channel)
+	defer release()
+	c.tracker = tracker
+	c.AddMetricSamples([]metrics.SampleContainer{transactionTestSample("custom_missing_hook", nil, false)})
+	require.ErrorContains(t, c.err(), "lacks producer completion tracking")
+	require.Empty(t, c.parts)
 }

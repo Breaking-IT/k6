@@ -306,7 +306,8 @@ func (w *webSocket) establishConnection(ctx context.Context, params *wsParams) {
 	w.started = time.Now()
 	handshakeDone := make(chan struct{})
 	go w.closePendingConnectionOnContextDone(ctx, handshakeDone)
-	start := time.Now()
+	ticket := metrics.BeginRequest(w.vu.State().Samples)
+	start := metrics.RequestTime(ticket, time.Now())
 	conn, httpResponse, connErr := w.dial(ctx, params)
 	w.connectionMu.Lock()
 	w.pendingConnection = nil
@@ -345,7 +346,7 @@ func (w *webSocket) establishConnection(ctx context.Context, params *wsParams) {
 	}
 
 	//nolint:contextcheck // Handshake cancellation must not suppress connection metrics.
-	w.emitConnectionMetrics(w.vu.Context(), start, connectionDuration)
+	w.emitConnectionMetrics(w.vu.Context(), start, connectionDuration, ticket)
 	if connErr != nil {
 		// Pass the error to the user script before exiting immediately
 		w.tq.Queue(func() error {
@@ -437,10 +438,14 @@ func (w *webSocket) closePendingConnection() {
 }
 
 // emitConnectionMetrics emits the metrics for a websocket connection.
-func (w *webSocket) emitConnectionMetrics(ctx context.Context, start time.Time, duration float64) {
+func (w *webSocket) emitConnectionMetrics(ctx context.Context, start time.Time, duration float64, tickets ...*metrics.RequestTicket) {
+	var ticket *metrics.RequestTicket
+	if len(tickets) > 0 {
+		ticket = tickets[0]
+	}
 	state := w.vu.State()
 
-	metrics.PushIfNotDone(ctx, state.Samples, metrics.ConnectedSamples{
+	metrics.PushTrackedRequest(ctx, state.Samples, ticket, metrics.ConnectedSamples{
 		Samples: []metrics.Sample{
 			{
 				TimeSeries: metrics.TimeSeries{Metric: state.BuiltinMetrics.WSSessions, Tags: w.tagsAndMeta.Tags},
@@ -827,7 +832,6 @@ func (w *webSocket) ping() {
 }
 
 func (w *webSocket) trackPong(pingID string) {
-	pongTimestamp := time.Now()
 
 	pingTimestamp, ok := w.sendPings.timestamps[pingID]
 	if !ok {
@@ -838,7 +842,9 @@ func (w *webSocket) trackPong(pingID string) {
 		return
 	}
 
-	metrics.PushIfNotDone(w.vu.Context(), w.vu.State().Samples, metrics.Sample{
+	ticket := metrics.BeginRequest(w.vu.State().Samples)
+	pongTimestamp := metrics.RequestTime(ticket, time.Now())
+	metrics.PushTrackedRequest(w.vu.Context(), w.vu.State().Samples, ticket, metrics.Sample{
 		TimeSeries: metrics.TimeSeries{
 			Metric: w.builtinMetrics.WSPing,
 			Tags:   w.tagsAndMeta.Tags,

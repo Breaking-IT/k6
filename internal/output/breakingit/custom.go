@@ -29,7 +29,16 @@ type customGroupKey struct {
 }
 
 type CustomOutput struct {
-	groups map[customGroupKey]*MetricGroup
+	browserMode     bool
+	groups          map[customGroupKey]*MetricGroup
+	groupTickets    map[customGroupKey]*metrics.RequestTicket
+	tracker         *metrics.RequestTracker
+	lanes           []*CustomOutput
+	owner           *CustomOutput
+	nextLane        int
+	watermark       int64
+	queuedWatermark int64
+	tokens          []string
 
 	mapper                           *Logger
 	client                           *http.Client
@@ -54,6 +63,7 @@ type CustomOutput struct {
 type customBatch struct {
 	body        []byte
 	contentType string
+	beforeUS    int64
 }
 
 // NewCustom is registered separately from timescaledb-breakingit in full and lean builds.
@@ -73,6 +83,17 @@ func NewCustom(params output.Params) (output.Output, error) {
 	if strings.EqualFold(env["K6_BROWSER_SCREENSHOT_ON_ERROR"], "true") {
 		return nil, errors.New("Custom DB k6 output does not yet support browser screenshot storage")
 	}
+	tokens := strings.Split(token, ",")
+	seen := map[string]bool{}
+	if len(tokens) > 4 {
+		return nil, errors.New("Custom DB supports 1-4 ingestion lanes")
+	}
+	for _, t := range tokens {
+		if t == "" || seen[t] {
+			return nil, errors.New("invalid Custom DB lane tokens")
+		}
+		seen[t] = true
+	}
 	source, err := parseTransactionSource(env["BREAKINGIT_TRANSACTION_SOURCE"])
 	if err != nil {
 		return nil, err
@@ -90,19 +111,29 @@ func NewCustom(params output.Params) (output.Output, error) {
 	}
 	tags := map[string]string{"run_id": runID, "location": env["location"], "node_name": env["nodeName"], "scenario_name": env["scenarioName"]}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxConnsPerHost = 1
+	transport.MaxConnsPerHost = len(tokens)
 	c := &CustomOutput{
-		base: strings.TrimRight(u.String(), "/") + "/runs/" + runID, token: token, runID: runID,
+		base: strings.TrimRight(u.String(), "/") + "/runs/" + runID, token: tokens[0], tokens: tokens, runID: runID,
 		client:       &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		retryTimeout: 30 * time.Second, queue: make(chan customBatch, 4), done: make(chan struct{}),
 		tickStop: make(chan struct{}), tickDone: make(chan struct{}), failed: make(chan struct{}), parts: map[string]*bytes.Buffer{},
 	}
+	for _, scenario := range params.ScriptOptions.Scenarios {
+		if opts := scenario.GetScenarioOptions(); opts != nil && len(opts.Browser) > 0 {
+			c.browserMode = true
+		}
+	}
 	c.groups = map[customGroupKey]*MetricGroup{}
+	c.groupTickets = map[customGroupKey]*metrics.RequestTicket{}
 	c.mapper = &Logger{out: params.StdOut, envTags: tags, customPatterns: patterns, transactionSource: source,
 		bufHTTP: &bytes.Buffer{}, bufVUs: &bytes.Buffer{}, bufTrans: &bytes.Buffer{}, bufErrors: &bytes.Buffer{},
 		pendingHttpGroups: map[int64]*MetricGroup{}, rowSink: c.addRow}
 	return c, nil
 }
+
+func (c *CustomOutput) UsesRequestTracking() bool { return !c.browserMode }
+
+func (c *CustomOutput) SetRequestTracker(t *metrics.RequestTracker) { c.tracker = t }
 
 func (c *CustomOutput) Description() string { return "custom-db-breakingit" }
 func (c *CustomOutput) SetTestRunStopCallback(callback func(error)) {
@@ -110,8 +141,19 @@ func (c *CustomOutput) SetTestRunStopCallback(callback func(error)) {
 	c.stopCallback = callback
 	c.failureMu.Unlock()
 }
-func (c *CustomOutput) err() error { c.failureMu.Lock(); defer c.failureMu.Unlock(); return c.failure }
+func (c *CustomOutput) err() error {
+	if c.owner != nil {
+		return c.owner.err()
+	}
+	c.failureMu.Lock()
+	defer c.failureMu.Unlock()
+	return c.failure
+}
 func (c *CustomOutput) fail(err error) {
+	if c.owner != nil {
+		c.owner.fail(err)
+		return
+	}
 	if err == nil {
 		return
 	}
@@ -130,27 +172,32 @@ func (c *CustomOutput) fail(err error) {
 	}
 }
 func (c *CustomOutput) Start() error {
-	// An empty HELLO is sufficient for a fresh source. Do not claim the Java
-	// monotonic sample-clock contract: k6 output callbacks cannot prove it.
-	var hello struct {
-		Incarnation string  `json:"incarnation"`
-		Accepted    *uint64 `json:"accepted_sequence"`
-		Sealed      bool    `json:"sealed"`
+	c.lanes = []*CustomOutput{c}
+	for _, token := range c.tokens[1:] {
+		c.lanes = append(c.lanes, &CustomOutput{owner: c, tracker: c.tracker, base: c.base, runID: c.runID, token: token,
+			client: c.client, retryTimeout: c.retryTimeout, queue: make(chan customBatch, 4), done: make(chan struct{}), failed: c.failed})
 	}
-	if err := c.request("/hello", []byte(`{}`), "application/json", 0, &hello); err != nil {
-		return err
+	for _, lane := range c.lanes {
+		if err := lane.hello(); err != nil {
+			for _, opened := range c.lanes {
+				if opened.encoder != nil {
+					opened.encoder.Close()
+				}
+			}
+			return err
+		}
+		encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+		if err != nil {
+			return err
+		}
+		lane.encoder = encoder
 	}
-	if hello.Sealed || hello.Incarnation == "" || hello.Accepted == nil || *hello.Accepted != 0 {
-		return errors.New("Custom DB requires a fresh unfinished producer source")
-	}
-	c.incarnation = hello.Incarnation
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
-	if err != nil {
-		return err
-	}
-	c.encoder = encoder
+	// One keep-alive connection and compression worker per ordered source.
+
 	c.started = true
-	go c.sender()
+	for _, lane := range c.lanes {
+		go lane.sender()
+	}
 	go func() {
 		defer close(c.tickDone)
 		tick := time.NewTicker(200 * time.Millisecond)
@@ -165,6 +212,7 @@ func (c *CustomOutput) Start() error {
 				c.addMu.Lock()
 				c.completeGroups(false)
 				c.flush()
+				c.publishWatermark()
 				c.addMu.Unlock()
 			}
 		}
@@ -179,6 +227,11 @@ func (c *CustomOutput) AddMetricSamples(samples []metrics.SampleContainer) {
 		return
 	}
 	for _, sc := range samples {
+		httpContainer := false
+		var ticket *metrics.RequestTicket
+		if tracked, ok := sc.(interface{ RequestTicket() *metrics.RequestTicket }); ok {
+			ticket = tracked.RequestTicket()
+		}
 		for _, sample := range sc.GetSamples() {
 			if sample.Metric.Name == "browser_errors" && sample.Tags.Map()["screenshot"] != "" {
 				c.fail(errors.New("browser screenshots require a Custom DB payload integration"))
@@ -188,10 +241,23 @@ func (c *CustomOutput) AddMetricSamples(samples []metrics.SampleContainer) {
 		for _, sample := range sc.GetSamples() {
 			key := httpMetricCanonicalKey(sample.Metric.Name)
 			if key == "" {
+				requestMetric := strings.HasPrefix(sample.Metric.Name, "custom_") || sample.Metric.Name == "ws_connecting" || sample.Metric.Name == "ws_ping"
+				if c.tracker != nil && requestMetric && ticket == nil {
+					c.fail(errors.New("request metric lacks producer completion tracking"))
+					return
+				}
 				c.mapper.AddMetricSamples([]metrics.SampleContainer{sample})
 				continue
 			}
+			httpContainer = true
+			if c.tracker != nil && ticket == nil {
+				c.fail(errors.New("HTTP metrics lack producer completion tracking; live watermark would be unsafe"))
+				return
+			}
 			id := customGroupKey{sample.Time.UnixNano(), sample.Tags}
+			if ticket != nil {
+				c.groupTickets[id] = ticket
+			}
 			g := c.groups[id]
 			if g == nil {
 				g = &MetricGroup{Timestamp: id.time, Tags: map[string]string{}, Values: map[string]float64{}}
@@ -211,6 +277,9 @@ func (c *CustomOutput) AddMetricSamples(samples []metrics.SampleContainer) {
 			}
 		}
 		c.completeGroups(false)
+		if !httpContainer {
+			ticket.Release()
+		}
 
 		if c.err() != nil {
 			return
@@ -246,6 +315,8 @@ func (c *CustomOutput) completeGroups(final bool) {
 		if complete {
 			delete(c.groups, key)
 			c.mapper.processHttpGroup(g)
+			c.groupTickets[key].Release()
+			delete(c.groupTickets, key)
 		} else if final {
 			c.fail(errors.New("incomplete HTTP metric group at final drain"))
 			return
@@ -307,11 +378,16 @@ func (c *CustomOutput) enqueueLocked() error {
 	if err := writer.Close(); err != nil {
 		return err
 	}
-	batch := customBatch{body.Bytes(), "multipart/mixed; boundary=" + writer.Boundary()}
+	batch := customBatch{body: body.Bytes(), contentType: "multipart/mixed; boundary=" + writer.Boundary()}
+	lane := c
+	if len(c.lanes) > 0 {
+		lane = c.lanes[c.nextLane]
+		c.nextLane = (c.nextLane + 1) % len(c.lanes)
+	}
 	select {
 	case <-c.failed:
 		return c.err()
-	case c.queue <- batch:
+	case lane.queue <- batch:
 		c.parts = map[string]*bytes.Buffer{}
 		c.batchBytes = 0
 		return nil
@@ -323,20 +399,12 @@ func (c *CustomOutput) sender() {
 		if c.err() != nil {
 			continue
 		}
+		if batch.beforeUS != 0 {
+			c.fail(c.sendControl("/watermark", batch.beforeUS))
+			continue
+		}
 		compressed := c.encoder.EncodeAll(batch.body, nil)
-		var ack struct {
-			Accepted *uint64 `json:"accepted"`
-		}
-		next := c.sequence + 1
-		if err := c.request("/ingest/batch", compressed, batch.contentType, next, &ack); err != nil {
-			c.fail(err)
-			continue
-		}
-		if ack.Accepted == nil || *ack.Accepted != next {
-			c.fail(errors.New("invalid Custom DB batch acknowledgement"))
-			continue
-		}
-		c.sequence = next
+		c.fail(c.sendBatch(compressed, batch.contentType))
 	}
 }
 
@@ -353,20 +421,21 @@ func (c *CustomOutput) Stop() error {
 			c.flush()
 		}
 		c.addMu.Unlock()
-		close(c.queue)
-		<-c.done
-		if c.err() == nil {
-			var ack struct {
-				Accepted *uint64 `json:"accepted_sequence"`
-				Finished bool    `json:"finished"`
-			}
-			err := c.request("/finish", nil, "application/octet-stream", c.sequence, &ack)
-			if err == nil && (ack.Accepted == nil || *ack.Accepted != c.sequence || !ack.Finished) {
-				err = errors.New("invalid Custom DB final acknowledgement")
-			}
-			c.fail(err)
+		for _, lane := range c.lanes {
+			close(lane.queue)
 		}
-		c.encoder.Close()
+		for _, lane := range c.lanes {
+			<-lane.done
+		}
+		for _, lane := range c.lanes {
+			if c.err() != nil {
+				break
+			}
+			c.fail(lane.sendControl("/finish", 0))
+		}
+		for _, lane := range c.lanes {
+			lane.encoder.Close()
+		}
 		c.client.CloseIdleConnections()
 		c.stopErr = c.err()
 	})
@@ -374,7 +443,7 @@ func (c *CustomOutput) Stop() error {
 }
 
 // Retries keep the same sequence, multipart boundary and compressed bytes.
-// A changed incarnation is deliberately fatal until k6 has a proven recovery clock.
+// Incarnation recovery is handled by the lane, after this request returns 409.
 func (c *CustomOutput) request(path string, body []byte, contentType string, seq uint64, result any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.retryTimeout)
 	defer cancel()
@@ -407,7 +476,7 @@ func (c *CustomOutput) request(path string, body []byte, contentType string, seq
 				return nil
 			}
 			if readErr == nil && response.StatusCode != 429 && response.StatusCode < 500 {
-				return fmt.Errorf("Custom DB %s rejected request (HTTP %d)", path, response.StatusCode)
+				return customRejection(response.StatusCode)
 			}
 		}
 		timer := time.NewTimer(100 * time.Millisecond)

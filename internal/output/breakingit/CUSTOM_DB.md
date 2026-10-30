@@ -11,19 +11,19 @@ writer. It does not use the older xk6 extension in the BreakTest repository.
 
 ## Invocation and application contract
 
-The application must first provision a Custom DB run and one producer token per
+The application must first provision a Custom DB run and one to four producer tokens per
 load generator. Pass the run ID and that generator's token when invoking k6:
 
 ```sh
 export runId='<provisioned-run-id>'
-export CUSTOM_STORAGE_TOKEN='<run-scoped-producer-token>'
+export CUSTOM_STORAGE_TOKEN='<lane-1-token>,<lane-2-token>'
 export location='Amsterdam'
 export nodeName='generator-1'
 k6 run --out custom-db-breakingit=https://storage.example.test script.js
 ```
 
 The URL is the service base URL (an optional routing prefix is retained). The
-writer appends `/runs/<runId>/hello`, `/ingest/batch` and `/finish` to it. TLS
+writer appends `/runs/<runId>/hello`, `/ingest/batch`, `/watermark` and `/finish` to it. TLS
 certificates are verified, connections reused, and redirects disabled so tokens
 cannot be redirected to another origin. Never pass the service admin token.
 
@@ -33,21 +33,21 @@ request rows, failed checks, browser errors and VUs use the existing mapping cod
 Unknown CSV fields remain NULL in the binary encoding, and negative/unavailable
 connect times become NULL. Error UUIDs are generated independently per output.
 
-The application must select the output from the frozen test backend, provide the
-producer credentials, and finalize/publish only after all producers finish.
-This fork change does **not** yet update the BreakTest launch configuration,
-remove its k6 preview restriction, rebuild its deployed generator image, or change
-any customer's storage selection. Those changes must accompany deployment.
+The application selects the output from the frozen test backend, provisions all
+lane tokens, and finalizes only after every lane finishes. BreakTest's integration
+requires generator capability `k6-custom-v2`, verified against the installed binary
+checksum; this prevents routing multi-lane jobs to the older single-source writer.
 Generator machine statistics remain the responsibility of the existing agent.
 
 ## Delivery and limits
 
-- Flush every 200 ms or at a 2 MiB encoded-row budget. Four queued batches bound
+- Flush every 200 ms or at a 2 MiB encoded-row budget. Four queued batches per lane bound
   outgoing buffering; a full queue applies backpressure rather than dropping rows.
   The building batch, one waiting enqueue, sender/compression buffers, and k6's own
-  sample containers consume additional memory; 8 MiB is not a total RSS limit.
-- One ordered sender per generator. Multiple generators have independent sources.
-  This first version does not claim the throughput of the parallel Java writer.
+  sample containers consume additional memory; 8 MiB per lane is not a total RSS limit.
+- One to four ordered compression/sender workers per generator, with independent
+  sequences and shared keep-alive connections. Batches are distributed round-robin.
+  Watermark-only messages reach idle lanes too. No high-load capacity claim yet.
 - Incomplete HTTP joins are limited to 4,096 groups / an estimated 2 MiB payload
   budget. Oversized rows or exhausted join budgets stop the run explicitly.
 - HTTP/browser joins include timestamp and tag-set identity. All required request
@@ -60,18 +60,37 @@ Generator machine statistics remain the responsibility of the existing agent.
 - Drain accepted sample containers and all queued requests before `/finish`.
   The producer does not seal the run itself. A final barrier proves delivery of
   this producer's data; it is not a durable-on-disk/fsync acknowledgement.
-- A fresh producer source is required. A server incarnation change is fatal in
-  this first implementation. Automatic relaxed-durability reconnect requires a
-  source clock contract that k6 does not yet supply.
+- A fresh producer source is required at startup. Native runs recover after a
+  server incarnation change using the anchored source clock and checkpoint sequence:
+  skip a held batch proven checkpointed; otherwise renumber and replay only that
+  unacknowledged batch. Previously acknowledged, lost rows are not replayed; the
+  service exposes its relaxed-durability coverage gaps. Same-incarnation conflicts
+  remain fatal. Browser runs without a proven source clock fail closed on restart.
 
 ## Watermarks and unsupported data
 
-This writer **does not send live watermarks**. k6 output callbacks can be delayed
-and out of event-time order, particularly for browser failure bodies. Neither
-wall-clock time nor the latest observed sample proves that older samples cannot
-arrive. Live reads therefore use the service's pending/raw and grace-period paths;
-the final producer barrier permits complete aggregation after drain. Proven live
-source barriers are a separate k6 core integration, not a timer setting.
+Native k6 runs send live request watermarks, using the same sequence-backed,
+all-source barrier as the Java writer. The output manager installs a per-run
+tracker before producers start. HTTP completion assigns its timestamp and pin
+atomically; WebSocket connecting/ping and custom metrics are similarly tracked.
+Pins survive the engine sample channel and pending metric joins until rows are
+serialized. A sharded tracker computes the oldest unresolved timestamp. It uses
+an anchored monotonic clock, so a wall-clock step cannot invalidate a sent barrier.
+
+After detaching all preceding rows, the writer queues the same whole-second
+barrier on every lane. A lane sends it only after acknowledging its earlier
+batches. The service closes the common prefix into immediate 1s aggregates; open
+seconds remain queryable through the pending/raw path. Event-time completeness
+still does not imply fsync durability. Transactions and monitoring are separate
+streams, just as in the Java request-watermark contract.
+
+**Browser scenarios are not yet at watermark parity.** Their request timestamps
+come from asynchronous Chromium/CDP events in another process. They retain the
+previous grace/pending/raw path, including mixed browser/native scenarios; a host
+wall-clock timer cannot prove their event-time completeness. Browser timestamps
+are not rewritten to manufacture progress. Browser live barriers require a
+separate CDP lifecycle contract. Uninstrumented native request metric producers
+fail closed rather than silently violating a watermark.
 
 Synthetic monitoring and browser screenshots are explicitly unsupported and
 rejected. Ordinary browser request timings, failure response data, native groups
@@ -81,12 +100,13 @@ also fails the output, rather than storing a dangling screenshot reference.
 ## Validation
 
 ```sh
-go test -race ./internal/output/breakingit
+go test -race ./metrics ./output ./lib/netext/httpext ./internal/output/breakingit
 go test -tags lean ./internal/cmd -run 'TestBuiltinOutputString|TestCustomDBAndTimescaleConstructors'
 go test ./internal/cmd -run 'TestBuiltinOutputString|TestCustomDBAndTimescaleConstructors'
 go build -tags lean -o /tmp/k6-custom-db-writer .
 python3 ai-tests/custom-db/smoke.py --k6 /tmp/k6-custom-db-writer \
-  --image breaktest-storage-lab:local
+  --image breaktest-storage-lab:local --lanes 4
+python3 ai-tests/custom-db/smoke.py --k6 /tmp/k6-custom-db-writer --lanes 4 --restart-live
 ```
 
 The smoke test creates its own disposable Docker service and temporary directory,
@@ -97,3 +117,8 @@ generated error UUIDs. It checks request, transaction, error and VU counts, comp
 sealing and reads after storage-service restart. It never connects to existing
 customer databases. This establishes protocol/mapping compatibility, not a
 TimescaleDB performance benchmark or browser end-to-end acceptance.
+
+The live smoke test also requires unfinished sources with advancing watermarks and
+complete aggregate buckets before finalization. Crash mode kills only its own
+throwaway service, verifies retained rows against the oracle without duplicates,
+and requires explicit incomplete coverage whenever rows were lost.

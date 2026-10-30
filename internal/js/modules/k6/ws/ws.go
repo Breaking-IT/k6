@@ -268,7 +268,8 @@ func (mi *WS) dial(
 		wsd.Jar = args.cookieJar
 	}
 
-	connStart := time.Now()
+	ticket := metrics.BeginRequest(state.Samples)
+	connStart := metrics.RequestTime(ticket, time.Now())
 	conn, httpResponse, dialErr := wsd.DialContext(ctx, url, args.headers)
 	connEnd := time.Now()
 
@@ -303,7 +304,7 @@ func (mi *WS) dial(
 		builtinMetrics:     state.BuiltinMetrics,
 	}
 
-	connEndHook := socket.pushSessionMetrics(connStart, connEnd)
+	connEndHook := socket.pushSessionMetrics(connStart, connEnd, ticket)
 
 	return &socket, httpResponse, connEndHook, dialErr
 }
@@ -392,7 +393,6 @@ func (s *Socket) Ping() {
 }
 
 func (s *Socket) trackPong(pingID string) {
-	pongTimestamp := time.Now()
 
 	if _, ok := s.pingSendTimestamps[pingID]; !ok {
 		// We received a pong for a ping we didn't send; ignore
@@ -400,8 +400,10 @@ func (s *Socket) trackPong(pingID string) {
 		return
 	}
 	pingTimestamp := s.pingSendTimestamps[pingID]
+	ticket := metrics.BeginRequest(s.samplesOutput)
+	pongTimestamp := metrics.RequestTime(ticket, time.Now())
 
-	metrics.PushIfNotDone(s.ctx, s.samplesOutput, metrics.Sample{
+	metrics.PushTrackedRequest(s.ctx, s.samplesOutput, ticket, metrics.Sample{
 		TimeSeries: metrics.TimeSeries{
 			Metric: s.builtinMetrics.WSPing,
 			Tags:   s.tagsAndMeta.Tags,
@@ -515,10 +517,14 @@ func (s *Socket) closeConnection(code int) error {
 	return err
 }
 
-func (s *Socket) pushSessionMetrics(connStart, connEnd time.Time) func() {
+func (s *Socket) pushSessionMetrics(connStart, connEnd time.Time, tickets ...*metrics.RequestTicket) func() {
+	var ticket *metrics.RequestTicket
+	if len(tickets) > 0 {
+		ticket = tickets[0]
+	}
 	connDuration := metrics.D(connEnd.Sub(connStart))
 
-	metrics.PushIfNotDone(s.ctx, s.samplesOutput, metrics.ConnectedSamples{
+	metrics.PushTrackedRequest(s.ctx, s.samplesOutput, ticket, metrics.ConnectedSamples{
 		Samples: []metrics.Sample{
 			{
 				TimeSeries: metrics.TimeSeries{

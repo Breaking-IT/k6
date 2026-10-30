@@ -14,7 +14,8 @@ import (
 // A Trail represents detailed information about an HTTP request.
 // You'd typically get one from a Tracer.
 type Trail struct {
-	EndTime time.Time
+	requestTicket *metrics.RequestTicket
+	EndTime       time.Time
 
 	// Total connect time (Connecting + TLSHandshaking)
 	ConnDuration time.Duration
@@ -120,6 +121,8 @@ func (tr *Trail) SaveSamples(builtinMetrics *metrics.BuiltinMetrics, ctm *metric
 		},
 	}...)
 }
+
+func (tr *Trail) RequestTicket() *metrics.RequestTicket { return tr.requestTicket }
 
 // GetSamples implements the metrics.SampleContainer interface.
 func (tr *Trail) GetSamples() []metrics.Sample {
