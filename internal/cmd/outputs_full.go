@@ -48,6 +48,7 @@ func getAllOutputConstructors() (map[string]output.Constructor, error) {
 		},
 		"web-dashboard": dashboard.New,
 		builtinOutputTimescaledbBreakingit.String(): breakingit.New,
+		builtinOutputCustomDBBreakingit.String():    breakingit.NewCustom,
 		builtinOutputExperimentalOpentelemetry.String(): func(params output.Params) (output.Output, error) {
 			params.Logger.Warnf("OpenTelemetry output has been graduated as a stable output."+
 				"You can now use just %q instead of %q. The experimental version will be removed in future versions.",

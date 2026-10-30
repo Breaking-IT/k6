@@ -106,3 +106,9 @@ an intentional nested transaction from two measurements of the same step.
 
 For a full migration, remove `pages.add()` and use `await group(...)` for timing
 and context, while keeping any business checks and throwing on failures.
+
+## Custom DB alternative
+
+The fork also includes `custom-db-breakingit` for direct binary delivery to the
+BreakTest Custom DB service. See [configuration, delivery semantics and current
+limits](CUSTOM_DB.md). The existing TimescaleDB output remains available.

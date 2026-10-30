@@ -6,8 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -62,6 +62,9 @@ const (
 
 // Logger writes k6 metric samples to pg-proxy using COPY via multipart batch
 type Logger struct {
+	// rowSink is used by the direct Custom DB output; nil preserves CSV/PG-proxy.
+	rowSink func(string, []string) error
+
 	out        io.Writer
 	proxyURL   string
 	database   string
@@ -69,9 +72,9 @@ type Logger struct {
 	httpClient *http.Client
 
 	// batch buffers
-	mu      sync.Mutex
-	bufHTTP *bytes.Buffer
-	bufVUs  *bytes.Buffer
+	mu         sync.Mutex
+	bufHTTP    *bytes.Buffer
+	bufVUs     *bytes.Buffer
 	bufTrans   *bytes.Buffer
 	bufErrors  *bytes.Buffer
 	batchTimer *time.Timer
@@ -625,9 +628,7 @@ func (l *Logger) AddMetricSamples(samples []metrics.SampleContainer) {
 					}
 				}
 				l.mu.Lock()
-				wt := csv.NewWriter(l.bufTrans)
-				_ = wt.Write(row)
-				wt.Flush()
+				l.writeRow(l.bufTrans, row)
 				l.mu.Unlock()
 				continue
 			}
@@ -674,9 +675,7 @@ func (l *Logger) AddMetricSamples(samples []metrics.SampleContainer) {
 					}
 				}
 				l.mu.Lock()
-				wt := csv.NewWriter(l.bufTrans)
-				_ = wt.Write(row)
-				wt.Flush()
+				l.writeRow(l.bufTrans, row)
 				l.mu.Unlock()
 				continue
 			}
@@ -692,9 +691,7 @@ func (l *Logger) AddMetricSamples(samples []metrics.SampleContainer) {
 					"",                                // finished_threads (unknown)
 				}
 				l.mu.Lock()
-				wv := csv.NewWriter(l.bufVUs)
-				_ = wv.Write(row)
-				wv.Flush()
+				l.writeRow(l.bufVUs, row)
 				l.mu.Unlock()
 				continue
 			}
@@ -733,25 +730,23 @@ func (l *Logger) AddMetricSamples(samples []metrics.SampleContainer) {
 						fmt.Sprintf("%v", l.envTags["scenario_name"]),   // scenario_name
 						fmt.Sprintf("%v", l.envTags["location"]),        // location
 						fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
-						m["scenario"],   // thread_group_name
-						transactionName, // transaction_name
-						samplerName,     // sampler_name
-						responseCode,    // response_code
-						responseTime,    // response_time
-						"",              // connection_time
-						url,             // url
-						"",              // assertions
-						checkMsg,        // response_message
-						requestData,     // request_headers (used for request data)
-						"",              // response_headers
-						responseData,    // response_data
-						id,              // id (UUIDv7 generated from measurement timestamp)
-						fmt.Sprintf("%v", l.envTags["run_id"]),          // run_id last
+						m["scenario"],                          // thread_group_name
+						transactionName,                        // transaction_name
+						samplerName,                            // sampler_name
+						responseCode,                           // response_code
+						responseTime,                           // response_time
+						"",                                     // connection_time
+						url,                                    // url
+						"",                                     // assertions
+						checkMsg,                               // response_message
+						requestData,                            // request_headers (used for request data)
+						"",                                     // response_headers
+						responseData,                           // response_data
+						id,                                     // id (UUIDv7 generated from measurement timestamp)
+						fmt.Sprintf("%v", l.envTags["run_id"]), // run_id last
 					}
 					l.mu.Lock()
-					we := csv.NewWriter(l.bufErrors)
-					_ = we.Write(row)
-					we.Flush()
+					l.writeRow(l.bufErrors, row)
 					l.mu.Unlock()
 				} else {
 					row := []string{
@@ -773,9 +768,7 @@ func (l *Logger) AddMetricSamples(samples []metrics.SampleContainer) {
 						id,              // id (UUIDv7 generated from measurement timestamp)
 					}
 					l.mu.Lock()
-					we := csv.NewWriter(l.bufErrors)
-					_ = we.Write(row)
-					we.Flush()
+					l.writeRow(l.bufErrors, row)
 					l.mu.Unlock()
 				}
 				continue
@@ -911,9 +904,7 @@ func (l *Logger) processHttpGroup(g *MetricGroup) {
 		}
 	}
 	l.mu.Lock()
-	w := csv.NewWriter(l.bufHTTP)
-	_ = w.Write(row)
-	w.Flush()
+	l.writeRow(l.bufHTTP, row)
 	// If not successful, also emit into requests_error(_sm)
 	if success == "false" {
 		// Build response_message from tags
@@ -981,9 +972,7 @@ func (l *Logger) processHttpGroup(g *MetricGroup) {
 				id,                // id (UUIDv7)
 				fmt.Sprintf("%v", l.envTags["run_id"]),
 			}
-			we := csv.NewWriter(l.bufErrors)
-			_ = we.Write(erow)
-			we.Flush()
+			l.writeRow(l.bufErrors, erow)
 		} else {
 			erow := []string{
 				time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
@@ -1003,9 +992,7 @@ func (l *Logger) processHttpGroup(g *MetricGroup) {
 				g.ErrorResBody,    // response_data
 				id,                // id (UUIDv7)
 			}
-			we := csv.NewWriter(l.bufErrors)
-			_ = we.Write(erow)
-			we.Flush()
+			l.writeRow(l.bufErrors, erow)
 		}
 	}
 	l.mu.Unlock()
@@ -1106,9 +1093,7 @@ func (l *Logger) processWebSocketMetric(s metrics.Sample, ts int64) {
 		}
 	}
 	l.mu.Lock()
-	w := csv.NewWriter(l.bufHTTP)
-	_ = w.Write(row)
-	w.Flush()
+	l.writeRow(l.bufHTTP, row)
 	l.mu.Unlock()
 }
 
@@ -1190,9 +1175,7 @@ func (l *Logger) processCustomTrendMetric(s metrics.Sample, ts int64) {
 		}
 	}
 	l.mu.Lock()
-	w := csv.NewWriter(l.bufHTTP)
-	_ = w.Write(row)
-	w.Flush()
+	l.writeRow(l.bufHTTP, row)
 	l.mu.Unlock()
 }
 
@@ -1241,19 +1224,19 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 			fmt.Sprintf("%v", l.envTags["scenario_name"]),   // scenario_name
 			fmt.Sprintf("%v", l.envTags["location"]),        // location
 			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
-			m["scenario"],   // thread_group_name
-			transactionName, // transaction_name
-			samplerName,     // sampler_name
-			"",              // response_code
-			"",              // response_time
-			"",              // connection_time
-			"",              // url
-			"",              // assertions
-			errMsg,          // response_message
-			"",              // request_headers
-			"",              // response_headers
-			screenshotHash,  // response_data (screenshot hash reference)
-			id,              // id (UUIDv7)
+			m["scenario"],                          // thread_group_name
+			transactionName,                        // transaction_name
+			samplerName,                            // sampler_name
+			"",                                     // response_code
+			"",                                     // response_time
+			"",                                     // connection_time
+			"",                                     // url
+			"",                                     // assertions
+			errMsg,                                 // response_message
+			"",                                     // request_headers
+			"",                                     // response_headers
+			screenshotHash,                         // response_data (screenshot hash reference)
+			id,                                     // id (UUIDv7)
 			fmt.Sprintf("%v", l.envTags["run_id"]), // run_id last
 		}
 		l.mu.Lock()
@@ -1263,9 +1246,7 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 			})
 			fmt.Fprintf(l.out, "[screenshot] queued for upsert, pendingScreenshots=%d\n", len(l.pendingScreenshots))
 		}
-		we := csv.NewWriter(l.bufErrors)
-		_ = we.Write(row)
-		we.Flush()
+		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()
 	} else {
 		row := []string{
@@ -1292,9 +1273,7 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 				screenshotHash, screenshot, "image/png", len(screenshot),
 			})
 		}
-		we := csv.NewWriter(l.bufErrors)
-		_ = we.Write(row)
-		we.Flush()
+		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()
 	}
 }
@@ -1477,4 +1456,24 @@ func normalizeRegex(p string) string {
 		"\\S", "[^ \t\r\n\f]",
 	)
 	return replacer.Replace(p)
+}
+
+// writeRow preserves one mapping for both storage backends. Call with mu held.
+func (l *Logger) writeRow(buf *bytes.Buffer, row []string) {
+	if l.rowSink != nil {
+		table := "requests_raw"
+		switch buf {
+		case l.bufTrans:
+			table = "transactions"
+		case l.bufVUs:
+			table = "virtual_users"
+		case l.bufErrors:
+			table = "requests_error"
+		}
+		_ = l.rowSink(table, row) // Sink records failures and stops the run.
+		return
+	}
+	w := csv.NewWriter(buf)
+	_ = w.Write(row)
+	w.Flush()
 }

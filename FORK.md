@@ -22,6 +22,8 @@ code to the k6 executable.
 ## Fork-specific changes
 
 - Adds the `timescaledb-breakingit` output for writing load-test data through a PG-proxy.
+- Adds the opt-in `custom-db-breakingit` direct output alongside TimescaleDB; see
+  [configuration and current limits](internal/output/breakingit/CUSTOM_DB.md).
 - Adds optional detailed request and response data for failed HTTP requests.
 - Extends browser network and error metrics, including optional error screenshots.
 - Adds the `lean` build tag used for smaller cloud-free release binaries.
