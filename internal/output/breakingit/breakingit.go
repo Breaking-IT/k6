@@ -73,6 +73,8 @@ type Logger struct {
 
 	// batch buffers
 	mu         sync.Mutex
+	flushMu    sync.Mutex // owns the entire drain, including follow-up batches
+	flushErr   error
 	bufHTTP    *bytes.Buffer
 	bufVUs     *bytes.Buffer
 	bufTrans   *bytes.Buffer
@@ -86,6 +88,7 @@ type Logger struct {
 	// merging state
 	pendingHttpGroups map[int64]*MetricGroup // http and browser (unified)
 	cleanupStop       chan struct{}
+	cleanupDone       chan struct{}
 	batchDone         chan struct{} // closed when batchLoop exits
 	envTags           map[string]string
 	customPatterns    map[string]string
@@ -179,6 +182,7 @@ func New(params output.Params) (output.Output, error) {
 		bufErrors:         &bytes.Buffer{},
 		pendingHttpGroups: make(map[int64]*MetricGroup),
 		cleanupStop:       make(chan struct{}),
+		cleanupDone:       make(chan struct{}),
 		batchDone:         make(chan struct{}),
 		envTags:           envTags,
 		customPatterns:    customPatterns,
@@ -195,16 +199,22 @@ func (l *Logger) Description() string { return "breakingit" }
 func (l *Logger) Start() error        { return nil }
 
 func (l *Logger) Stop() error {
-	fmt.Fprintf(l.out, "[screenshot] Stop() called, waiting for batchLoop to finish\n")
 	l.batchTimer.Stop()
 	close(l.cleanupStop)
-	// Wait for any in-progress batchLoop flush to complete
 	<-l.batchDone
-	fmt.Fprintf(l.out, "[screenshot] batchLoop done, running final flush (pendingScreenshots=%d)\n", len(l.pendingScreenshots))
-	// Final flush to send any remaining data (including screenshots)
+	<-l.cleanupDone
+	// Cleanup can own a detached metric group; join it before draining the tail.
+	l.mu.Lock()
+	groups := l.pendingHttpGroups
+	l.pendingHttpGroups = make(map[int64]*MetricGroup)
+	l.mu.Unlock()
+	for _, g := range groups {
+		l.processHttpGroup(g)
+	}
 	l.flush()
-	fmt.Fprintf(l.out, "[screenshot] Stop() complete\n")
-	return nil
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.flushErr
 }
 
 func (l *Logger) batchLoop() {
@@ -228,6 +238,7 @@ func (l *Logger) batchLoop() {
 }
 
 func (l *Logger) cleanupProcessor() {
+	defer close(l.cleanupDone)
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
 	for {
@@ -252,7 +263,23 @@ func (l *Logger) cleanupProcessor() {
 	}
 }
 
+// A single owner drains every accepted tail batch. Stop must join that owner;
+// spawning a follow-up goroutine lets Stop return while rows are still in flight.
 func (l *Logger) flush() {
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+	for {
+		l.flushOnce()
+		l.mu.Lock()
+		more := l.flushErr == nil && (l.bufHTTP.Len() > 0 || l.bufVUs.Len() > 0 || l.bufTrans.Len() > 0 || l.bufErrors.Len() > 0 || len(l.pendingScreenshots) > 0)
+		l.mu.Unlock()
+		if !more {
+			return
+		}
+	}
+}
+
+func (l *Logger) flushOnce() {
 	l.mu.Lock()
 	// Prevent recursive flush calls
 	if l.flushing {
@@ -418,29 +445,24 @@ func (l *Logger) flush() {
 
 	// Reset buffers and check for new data that accumulated during retries
 	l.mu.Lock()
-	hasNewData := false
 	var newHTTPData, newVUsData, newTransData, newErrorsData []byte
 
 	if success {
 		// Check if any buffers grew during retries (new data accumulated)
 		// If so, preserve the new data before clearing
 		if l.bufHTTP.Len() > bufHTTPLen {
-			hasNewData = true
 			newHTTPData = make([]byte, l.bufHTTP.Len()-bufHTTPLen)
 			copy(newHTTPData, l.bufHTTP.Bytes()[bufHTTPLen:])
 		}
 		if l.bufVUs.Len() > bufVUsLen {
-			hasNewData = true
 			newVUsData = make([]byte, l.bufVUs.Len()-bufVUsLen)
 			copy(newVUsData, l.bufVUs.Bytes()[bufVUsLen:])
 		}
 		if l.bufTrans.Len() > bufTransLen {
-			hasNewData = true
 			newTransData = make([]byte, l.bufTrans.Len()-bufTransLen)
 			copy(newTransData, l.bufTrans.Bytes()[bufTransLen:])
 		}
 		if l.bufErrors.Len() > bufErrorsLen {
-			hasNewData = true
 			newErrorsData = make([]byte, l.bufErrors.Len()-bufErrorsLen)
 			copy(newErrorsData, l.bufErrors.Bytes()[bufErrorsLen:])
 		}
@@ -465,7 +487,9 @@ func (l *Logger) flush() {
 			l.bufErrors.Write(newErrorsData)
 		}
 	} else {
-		// Retry loop exited without success (either timeout or early break), clear buffers to prevent unbounded growth
+		// Report delivery failure at Stop rather than claiming a successful drain.
+		l.flushErr = fmt.Errorf("pg-proxy delivery failed after %d attempts", attempts)
+		// Clear buffers to prevent unbounded growth after failed retries.
 		l.bufHTTP.Reset()
 		l.bufVUs.Reset()
 		l.bufTrans.Reset()
@@ -474,12 +498,6 @@ func (l *Logger) flush() {
 	l.flushing = false
 	l.mu.Unlock()
 
-	// If new data accumulated during retries and we succeeded, flush immediately to send it
-	// This ensures no gap in data delivery
-	if success && hasNewData {
-		// Use a goroutine to avoid blocking and prevent potential deadlock
-		go l.flush()
-	}
 }
 
 // upsertScreenshots sends screenshots to the pg-proxy upsert endpoint.
