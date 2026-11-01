@@ -56,7 +56,7 @@ func getAllOutputConstructors() (map[string]output.Constructor, error) {
 			return nil, errors.New("the web-dashboard output is not available in this lean build of k6")
 		},
 		builtinOutputTimescaledbBreakingit.String(): breakingit.New,
-		builtinOutputCustomDBBreakingit.String():    breakingit.NewCustom,
+		builtinOutputBreakTestDBBreakingit.String(): breakingit.NewBreakTestDB,
 	}
 
 	exts := ext.Get(ext.OutputExtension)

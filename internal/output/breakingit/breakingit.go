@@ -62,7 +62,7 @@ const (
 
 // Logger writes k6 metric samples to pg-proxy using COPY via multipart batch
 type Logger struct {
-	// rowSink is used by the direct Custom DB output; nil preserves CSV/PG-proxy.
+	// rowSink is used by the direct BreakTest DB output; nil preserves CSV/PG-proxy.
 	rowSink func(string, []string) error
 
 	out        io.Writer

@@ -11,7 +11,7 @@ import (
 )
 
 const pgEpochSeconds int64 = 946684800
-const customBatchBytes = 2 * 1024 * 1024
+const dbBatchBytes = 2 * 1024 * 1024
 
 // PostgreSQL binary COPY types in the existing non-SM BreakTest table order.
 // t = timestamp, s = text, i = int32, b = boolean, u = UUID.
@@ -22,7 +22,7 @@ var customSchemas = map[string]string{
 	"virtual_users":  "tsssiii",
 }
 
-func encodeCustomRow(table string, row []string) ([]byte, error) {
+func encodeDBRow(table string, row []string) ([]byte, error) {
 	schema := customSchemas[table]
 	if schema == "" || len(row) != len(schema) {
 		return nil, fmt.Errorf("invalid %s row width: %d", table, len(row))
@@ -32,8 +32,8 @@ func encodeCustomRow(table string, row []string) ([]byte, error) {
 	for _, s := range row {
 		size += len(s)
 	}
-	if size > customBatchBytes-1024 {
-		return nil, fmt.Errorf("%s row exceeds Custom DB batch budget", table)
+	if size > dbBatchBytes-1024 {
+		return nil, fmt.Errorf("%s row exceeds BreakTest DB batch budget", table)
 	}
 	b := bytes.NewBuffer(make([]byte, 0, size))
 	_ = binary.Write(b, binary.BigEndian, int16(len(row)))
@@ -55,7 +55,7 @@ func encodeCustomRow(table string, row []string) ([]byte, error) {
 			}
 			n := (t.Unix()-pgEpochSeconds)*1_000_000 + int64(t.Nanosecond()/1000)
 			if n < 0 {
-				return nil, fmt.Errorf("timestamp before Custom DB epoch")
+				return nil, fmt.Errorf("timestamp before BreakTest DB epoch")
 			}
 			data = binary.BigEndian.AppendUint64(nil, uint64(n))
 		case 'i':

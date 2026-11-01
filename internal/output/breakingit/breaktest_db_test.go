@@ -23,15 +23,15 @@ import (
 	"go.k6.io/k6/v2/output"
 )
 
-func newCustomTest(t *testing.T, endpoint string) *CustomOutput {
+func newBreakTestDBTest(t *testing.T, endpoint string) *BreakTestDBOutput {
 	t.Helper()
-	out, err := NewCustom(output.Params{ConfigArgument: endpoint, StdOut: io.Discard, Environment: map[string]string{
-		"runId": "run-123", "CUSTOM_STORAGE_TOKEN": "producer-token", "location": "Amsterdam", "nodeName": "node-1",
+	out, err := NewBreakTestDB(output.Params{ConfigArgument: endpoint, StdOut: io.Discard, Environment: map[string]string{
+		"runId": "run-123", "BREAKTEST_DB_TOKEN": "producer-token", "location": "Amsterdam", "nodeName": "node-1",
 	}})
 	require.NoError(t, err)
-	return out.(*CustomOutput)
+	return out.(*BreakTestDBOutput)
 }
-func decodeCustomBatch(t *testing.T, data []byte, content string) map[string][][][]byte {
+func decodeDBBatch(t *testing.T, data []byte, content string) map[string][][][]byte {
 	t.Helper()
 	decoder, err := zstd.NewReader(nil)
 	require.NoError(t, err)
@@ -79,7 +79,7 @@ func decodeCustomBatch(t *testing.T, data []byte, content string) map[string][][
 	}
 	return result
 }
-func TestCustomBinaryMatchesCSVMapping(t *testing.T) {
+func TestBreakTestDBBinaryMatchesCSVMapping(t *testing.T) {
 	t.Parallel()
 	rows := []struct {
 		table string
@@ -90,7 +90,7 @@ func TestCustomBinaryMatchesCSVMapping(t *testing.T) {
 		{"requests_error", []string{"2026-10-30T12:00:00Z", "run-123", "NL", "node", "Checkout", "/pay", "503", "100", "", "https://example.test/", "", "bad\nreply", "POST,\"a\"", "Header: value", "雪", "019a3524-3890-7000-8000-000000000001"}},
 		{"virtual_users", []string{"2026-10-30T12:00:00Z", "run-123", "NL", "node", "10", "", ""}},
 	}
-	c := newCustomTest(t, "http://localhost")
+	c := newBreakTestDBTest(t, "http://localhost")
 	for _, r := range rows {
 		require.NoError(t, c.addRow(r.table, r.row))
 	}
@@ -99,7 +99,7 @@ func TestCustomBinaryMatchesCSVMapping(t *testing.T) {
 	encoder, err := zstd.NewWriter(nil)
 	require.NoError(t, err)
 	defer encoder.Close()
-	decoded := decodeCustomBatch(t, encoder.EncodeAll(batch.body, nil), batch.contentType)
+	decoded := decodeDBBatch(t, encoder.EncodeAll(batch.body, nil), batch.contentType)
 	require.Len(t, decoded, 4)
 	require.Nil(t, decoded["requests_raw"][0][9])
 	require.Nil(t, decoded["requests_raw"][0][6])
@@ -124,7 +124,7 @@ func TestCustomBinaryMatchesCSVMapping(t *testing.T) {
 	require.Equal(t, expected, actual)
 }
 
-func TestCustomRetriesExactBytesAndFinalDrain(t *testing.T) {
+func TestBreakTestDBRetriesExactBytesAndFinalDrain(t *testing.T) {
 	t.Parallel()
 	var first []byte
 	var content string
@@ -164,7 +164,7 @@ func TestCustomRetriesExactBytesAndFinalDrain(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	c := newCustomTest(t, server.URL)
+	c := newBreakTestDBTest(t, server.URL)
 	require.NoError(t, c.Start())
 	c.AddMetricSamples([]metrics.SampleContainer{transactionTestSample("group_duration", nil, false)})
 	require.NoError(t, c.Stop())
@@ -172,11 +172,11 @@ func TestCustomRetriesExactBytesAndFinalDrain(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Equal(t, 1, finishes)
-	decoded := decodeCustomBatch(t, first, content)
+	decoded := decodeDBBatch(t, first, content)
 	require.Len(t, decoded["transactions"], 1)
 }
 
-func TestCustomFailureForbidsFinish(t *testing.T) {
+func TestBreakTestDBFailureForbidsFinish(t *testing.T) {
 	for _, status := range []int{400, 401, 403, 409, 413, 429, 503, 200} {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
 			var finished bool
@@ -192,7 +192,7 @@ func TestCustomFailureForbidsFinish(t *testing.T) {
 				fmt.Fprint(w, `{"accepted":999}`)
 			}))
 			defer server.Close()
-			c := newCustomTest(t, server.URL)
+			c := newBreakTestDBTest(t, server.URL)
 			c.retryTimeout = 50 * time.Millisecond
 			stopped := make(chan error, 1)
 			c.SetTestRunStopCallback(func(err error) { stopped <- err })
@@ -210,26 +210,26 @@ func TestCustomFailureForbidsFinish(t *testing.T) {
 	}
 }
 
-func TestCustomConfigurationAndBounds(t *testing.T) {
+func TestBreakTestDBConfigurationAndBounds(t *testing.T) {
 	t.Parallel()
-	for _, entry := range []struct{ k, v string }{{"syntheticMonitoring", "true"}, {"K6_BROWSER_SCREENSHOT_ON_ERROR", "true"}, {"runId", "../wrong"}, {"CUSTOM_STORAGE_TOKEN", ""}, {"BREAKINGIT_TRANSACTION_SOURCE", "wrong"}} {
-		env := map[string]string{"runId": "test", "CUSTOM_STORAGE_TOKEN": "token"}
+	for _, entry := range []struct{ k, v string }{{"syntheticMonitoring", "true"}, {"K6_BROWSER_SCREENSHOT_ON_ERROR", "true"}, {"runId", "../wrong"}, {"BREAKTEST_DB_TOKEN", ""}, {"BREAKINGIT_TRANSACTION_SOURCE", "wrong"}} {
+		env := map[string]string{"runId": "test", "BREAKTEST_DB_TOKEN": "token"}
 		env[entry.k] = entry.v
-		_, err := NewCustom(output.Params{ConfigArgument: "http://localhost", Environment: env})
+		_, err := NewBreakTestDB(output.Params{ConfigArgument: "http://localhost", Environment: env})
 		require.Error(t, err)
 	}
-	_, err := NewCustom(output.Params{ConfigArgument: "http://user:password@localhost"})
+	_, err := NewBreakTestDB(output.Params{ConfigArgument: "http://user:password@localhost"})
 	require.Error(t, err)
-	c := newCustomTest(t, "http://localhost")
-	row := []string{"2026-10-30T00:00:00Z", "run-123", "NL", strings.Repeat("x", customBatchBytes), "true", "", "", "1"}
+	c := newBreakTestDBTest(t, "http://localhost")
+	row := []string{"2026-10-30T00:00:00Z", "run-123", "NL", strings.Repeat("x", dbBatchBytes), "true", "", "", "1"}
 	require.Error(t, c.addRow("transactions", row))
 	require.Error(t, c.err())
 	require.Empty(t, c.queue)
 }
 
-func TestCustomHTTPJoinsAndLateFailures(t *testing.T) {
+func TestBreakTestDBHTTPJoinsAndLateFailures(t *testing.T) {
 	t.Parallel()
-	c := newCustomTest(t, "http://localhost")
+	c := newBreakTestDBTest(t, "http://localhost")
 	var rows [][]string
 	c.mapper.rowSink = func(table string, row []string) error {
 		if table == "requests_raw" {
@@ -264,17 +264,17 @@ func TestCustomHTTPJoinsAndLateFailures(t *testing.T) {
 	}
 }
 
-func TestCustomIncompleteDrainFails(t *testing.T) {
+func TestBreakTestDBIncompleteDrainFails(t *testing.T) {
 	t.Parallel()
-	c := newCustomTest(t, "http://localhost")
+	c := newBreakTestDBTest(t, "http://localhost")
 	c.AddMetricSamples([]metrics.SampleContainer{transactionTestSample("http_req_duration", nil, false)})
 	c.completeGroups(true)
 	require.ErrorContains(t, c.err(), "incomplete HTTP metric group")
 }
 
-func TestCustomQueueBackpressure(t *testing.T) {
+func TestBreakTestDBQueueBackpressure(t *testing.T) {
 	t.Parallel()
-	c := newCustomTest(t, "http://localhost")
+	c := newBreakTestDBTest(t, "http://localhost")
 	row := []string{"2026-10-30T12:00:00Z", "run-123", "NL", "Checkout", "true", "", "", "1"}
 	for range cap(c.queue) {
 		require.NoError(t, c.addRow("transactions", row))
@@ -296,26 +296,26 @@ func TestCustomQueueBackpressure(t *testing.T) {
 	require.Len(t, c.queue, cap(c.queue))
 }
 
-func TestCustomStartupRejectsNonFreshAndMissingAck(t *testing.T) {
+func TestBreakTestDBStartupRejectsNonFreshAndMissingAck(t *testing.T) {
 	t.Parallel()
 	for _, body := range []string{`{}`, `{"incarnation":"a"}`, `{"incarnation":"a","accepted_sequence":1}`, `{"incarnation":"a","accepted_sequence":0,"sealed":true}`} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, body) }))
-		c := newCustomTest(t, server.URL)
+		c := newBreakTestDBTest(t, server.URL)
 		require.Error(t, c.Start())
 		require.False(t, c.started)
 		server.Close()
 	}
 }
 
-func TestCustomHTTPDuplicateIdentityFails(t *testing.T) {
+func TestBreakTestDBHTTPDuplicateIdentityFails(t *testing.T) {
 	t.Parallel()
-	c := newCustomTest(t, "http://localhost")
+	c := newBreakTestDBTest(t, "http://localhost")
 	sample := transactionTestSample("http_req_duration", nil, false)
 	c.AddMetricSamples([]metrics.SampleContainer{sample, sample})
 	require.ErrorContains(t, c.err(), "ambiguous HTTP metric identity")
 }
 
-func TestCustomWatermarkWaitsForEveryLaneAndPendingProducer(t *testing.T) {
+func TestBreakTestDBWatermarkWaitsForEveryLaneAndPendingProducer(t *testing.T) {
 	var mu sync.Mutex
 	sequences := map[string]uint64{}
 	watermarks := map[string]int64{}
@@ -347,7 +347,7 @@ func TestCustomWatermarkWaitsForEveryLaneAndPendingProducer(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	c := newCustomTest(t, server.URL)
+	c := newBreakTestDBTest(t, server.URL)
 	c.tokens = []string{"producer-token", "second"}
 	ch := make(chan metrics.SampleContainer, 1)
 	tracker, release := metrics.BindRequestTracker(ch)
@@ -380,7 +380,7 @@ func TestCustomWatermarkWaitsForEveryLaneAndPendingProducer(t *testing.T) {
 	require.Equal(t, uint64(2), sequences["Bearer second"])
 }
 
-func TestCustomRecoveryReplaysOnlyUnacknowledgedBatch(t *testing.T) {
+func TestBreakTestDBRecoveryReplaysOnlyUnacknowledgedBatch(t *testing.T) {
 	for _, checkpoint := range []uint64{0, 2} {
 		t.Run(strconv.Itoa(int(checkpoint)), func(t *testing.T) {
 			calls := 0
@@ -405,7 +405,7 @@ func TestCustomRecoveryReplaysOnlyUnacknowledgedBatch(t *testing.T) {
 				fmt.Fprint(w, `{"accepted":1}`)
 			}))
 			defer server.Close()
-			c := newCustomTest(t, server.URL)
+			c := newBreakTestDBTest(t, server.URL)
 			ch := make(chan metrics.SampleContainer)
 			tracker, release := metrics.BindRequestTracker(ch)
 			defer release()
@@ -425,7 +425,7 @@ func TestCustomRecoveryReplaysOnlyUnacknowledgedBatch(t *testing.T) {
 }
 
 func TestTrackedHTTPJoinKeepsPinUntilFailureMetric(t *testing.T) {
-	c := newCustomTest(t, "http://localhost")
+	c := newBreakTestDBTest(t, "http://localhost")
 	channel := make(chan metrics.SampleContainer)
 	tracker, release := metrics.BindRequestTracker(channel)
 	defer release()
@@ -452,18 +452,18 @@ func TestTrackedHTTPJoinKeepsPinUntilFailureMetric(t *testing.T) {
 }
 
 func TestUntrackedRequestCannotCrossNativeWatermark(t *testing.T) {
-	c := newCustomTest(t, "http://localhost")
+	c := newBreakTestDBTest(t, "http://localhost")
 	channel := make(chan metrics.SampleContainer)
 	tracker, release := metrics.BindRequestTracker(channel)
 	defer release()
 	c.tracker = tracker
-	c.AddMetricSamples([]metrics.SampleContainer{transactionTestSample("custom_missing_hook", nil, false)})
+	c.AddMetricSamples([]metrics.SampleContainer{transactionTestSample("db_missing_hook", nil, false)})
 	require.ErrorContains(t, c.err(), "lacks producer completion tracking")
 	require.Empty(t, c.parts)
 }
 
-func TestCustomFullBatchRespectsStorageDecoderWindow(t *testing.T) {
-	encoder, err := newCustomEncoder()
+func TestBreakTestDBFullBatchRespectsStorageDecoderWindow(t *testing.T) {
+	encoder, err := newDBEncoder()
 	require.NoError(t, err)
 	defer encoder.Close()
 	plain := bytes.Repeat([]byte("large-request-metric-row\n"), 100000)

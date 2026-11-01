@@ -35,7 +35,7 @@ const (
 	builtinOutputOpentelemetry
 	builtinOutputSummary
 	builtinOutputTimescaledbBreakingit
-	builtinOutputCustomDBBreakingit
+	builtinOutputBreakTestDBBreakingit
 )
 
 func getPossibleIDList(constrs map[string]output.Constructor) string {

@@ -1,25 +1,25 @@
-# Direct Custom DB output
+# Direct BreakTest DB output
 
 The fork has two independent built-in outputs, in both normal and `lean` builds:
 
 - `timescaledb-breakingit`: the existing CSV/PG-proxy writer.
-- `custom-db-breakingit`: direct zstd-compressed PostgreSQL binary COPY batches
-  to the BreakTest Custom DB service. It does not contact PostgreSQL or PG-proxy.
+- `breaktest-db-breakingit`: direct zstd-compressed PostgreSQL binary COPY batches
+  to the BreakTest BreakTest DB service. It does not contact PostgreSQL or PG-proxy.
 
 The implementation lives in this fork, alongside the active built-in TimescaleDB
 writer. It does not use the older xk6 extension in the BreakTest repository.
 
 ## Invocation and application contract
 
-The application must first provision a Custom DB run and one to four producer tokens per
+The application must first provision a BreakTest DB run and one to four producer tokens per
 load generator. Pass the run ID and that generator's token when invoking k6:
 
 ```sh
 export runId='<provisioned-run-id>'
-export CUSTOM_STORAGE_TOKEN='<lane-1-token>,<lane-2-token>'
+export BREAKTEST_DB_TOKEN='<lane-1-token>,<lane-2-token>'
 export location='Amsterdam'
 export nodeName='generator-1'
-k6 run --out custom-db-breakingit=https://storage.example.test script.js
+k6 run --out breaktest-db-breakingit=https://storage.example.test script.js
 ```
 
 The URL is the service base URL (an optional routing prefix is retained). The
@@ -91,7 +91,7 @@ survives deferred work and the output queue; skipped cached requests release it.
 Mixed browser/native scenarios use the same tracker and lane barriers.
 
 **Timestamp contract:** browser sampler timestamps now mean generator-observed
-terminal CDP completion, for both Custom DB and TimescaleDB outputs. Previously,
+terminal CDP completion, for both BreakTest DB and TimescaleDB outputs. Previously,
 successful rows used the response-header timestamp. Chromium phase/duration
 measurements remain in their original time base. CDP transport delay precedes
 this observation; this is not a claim that Chromium's original event clock is
@@ -110,9 +110,9 @@ go test -race ./metrics ./output ./lib/netext/httpext ./internal/output/breaking
 go test -tags lean ./internal/cmd -run 'TestBuiltinOutputString|TestCustomDBAndTimescaleConstructors'
 go test ./internal/cmd -run 'TestBuiltinOutputString|TestCustomDBAndTimescaleConstructors'
 go build -tags lean -o /tmp/k6-custom-db-writer .
-python3 ai-tests/custom-db/smoke.py --k6 /tmp/k6-custom-db-writer \
+python3 ai-tests/breaktest-db/smoke.py --k6 /tmp/k6-custom-db-writer \
   --image breaktest-storage-lab:local --lanes 4
-python3 ai-tests/custom-db/smoke.py --k6 /tmp/k6-custom-db-writer --lanes 4 --restart-live
+python3 ai-tests/breaktest-db/smoke.py --k6 /tmp/k6-custom-db-writer --lanes 4 --restart-live
 ```
 
 The smoke test creates its own disposable Docker service and temporary directory,

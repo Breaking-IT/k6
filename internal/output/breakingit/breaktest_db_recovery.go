@@ -6,10 +6,10 @@ import (
 	"fmt"
 )
 
-type customRejection int
+type dbRejection int
 
-func (s customRejection) Error() string {
-	return fmt.Sprintf("Custom DB rejected request (HTTP %d)", int(s))
+func (s dbRejection) Error() string {
+	return fmt.Sprintf("BreakTest DB rejected request (HTTP %d)", int(s))
 }
 
 type sourceHello struct {
@@ -19,7 +19,7 @@ type sourceHello struct {
 	Sealed      bool    `json:"sealed"`
 }
 
-func (c *CustomOutput) register() (sourceHello, error) {
+func (c *BreakTestDBOutput) register() (sourceHello, error) {
 	body := []byte(`{}`)
 	if c.tracker != nil {
 		body, _ = json.Marshal(map[string]any{"source_clock_us": c.tracker.Clock().UnixMicro() - pgEpochSeconds*1_000_000, "clock_contract": "sample-end-monotonic-v1"})
@@ -32,8 +32,8 @@ func (c *CustomOutput) register() (sourceHello, error) {
 // Acknowledged, uncheckpointed rows may be lost under relaxed durability. The
 // server exposes that loss as coverage gaps. Replay only the held unacknowledged
 // batch, never already acknowledged history. Each ordered lane recovers itself.
-func (c *CustomOutput) recoverSource(err error) (uint64, error) {
-	var status customRejection
+func (c *BreakTestDBOutput) recoverSource(err error) (uint64, error) {
+	var status dbRejection
 	if c.tracker == nil || !errors.As(err, &status) || status != 409 {
 		return 0, err
 	}
@@ -49,7 +49,7 @@ func (c *CustomOutput) recoverSource(err error) (uint64, error) {
 	return *hello.Checkpoint, nil
 }
 
-func (c *CustomOutput) sendBatch(body []byte, content string) error {
+func (c *BreakTestDBOutput) sendBatch(body []byte, content string) error {
 	for attempt := 0; attempt < 4; attempt++ {
 		next := c.sequence + 1
 		var ack struct {
@@ -58,7 +58,7 @@ func (c *CustomOutput) sendBatch(body []byte, content string) error {
 		err := c.request("/ingest/batch", body, content, next, &ack)
 		if err == nil {
 			if ack.Accepted == nil || *ack.Accepted != next {
-				return errors.New("invalid Custom DB batch acknowledgement")
+				return errors.New("invalid BreakTest DB batch acknowledgement")
 			}
 			c.sequence = next
 			return nil
@@ -74,10 +74,10 @@ func (c *CustomOutput) sendBatch(body []byte, content string) error {
 			return nil
 		} // Lost ACK, but checkpoint proves this batch persisted.
 	}
-	return errors.New("Custom DB restarted repeatedly during batch delivery")
+	return errors.New("BreakTest DB restarted repeatedly during batch delivery")
 }
 
-func (c *CustomOutput) sendControl(path string, before int64) error {
+func (c *BreakTestDBOutput) sendControl(path string, before int64) error {
 	body := []byte(nil)
 	if path == "/watermark" {
 		body, _ = json.Marshal(map[string]int64{"before_us": before})
@@ -92,7 +92,7 @@ func (c *CustomOutput) sendControl(path string, before int64) error {
 		err := c.request(path, body, "application/json", c.sequence, &ack)
 		if err == nil {
 			if ack.Accepted == nil || *ack.Accepted != c.sequence || (path == "/watermark" && ack.Watermark != before) || (path == "/finish" && !ack.Finished) {
-				return errors.New("invalid Custom DB control acknowledgement")
+				return errors.New("invalid BreakTest DB control acknowledgement")
 			}
 			return nil
 		}
@@ -102,5 +102,5 @@ func (c *CustomOutput) sendControl(path string, before int64) error {
 			return errors.New("checkpoint exceeds acknowledged sequence")
 		}
 	}
-	return errors.New("Custom DB restarted repeatedly during control delivery")
+	return errors.New("BreakTest DB restarted repeatedly during control delivery")
 }

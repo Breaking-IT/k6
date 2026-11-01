@@ -4,13 +4,13 @@ import (
 	"errors"
 )
 
-func (c *CustomOutput) hello() error {
+func (c *BreakTestDBOutput) hello() error {
 	hello, err := c.register()
 	if err != nil {
 		return err
 	}
 	if hello.Sealed || hello.Incarnation == "" || hello.Accepted == nil || *hello.Accepted != 0 {
-		return errors.New("Custom DB requires a fresh unfinished producer source")
+		return errors.New("BreakTest DB requires a fresh unfinished producer source")
 	}
 	c.incarnation = hello.Incarnation
 	return nil
@@ -19,7 +19,7 @@ func (c *CustomOutput) hello() error {
 // Called under addMu, after detaching every serialized row. Tickets in the engine
 // queue and incomplete joins still pin Before(). Each FIFO carries its own barrier:
 // the database takes the minimum across all lanes and generators.
-func (c *CustomOutput) publishWatermark() {
+func (c *BreakTestDBOutput) publishWatermark() {
 	if c.tracker == nil || c.err() != nil {
 		return
 	}
@@ -31,7 +31,7 @@ func (c *CustomOutput) publishWatermark() {
 		select {
 		case <-c.failed:
 			return
-		case lane.queue <- customBatch{beforeUS: before}:
+		case lane.queue <- dbBatch{beforeUS: before}:
 		}
 	}
 	c.queuedWatermark = before

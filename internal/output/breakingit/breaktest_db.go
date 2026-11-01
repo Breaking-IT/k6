@@ -21,19 +21,19 @@ import (
 	"go.k6.io/k6/v2/output"
 )
 
-// CustomOutput reuses BreakTest's metric mappings, with bounded direct binary delivery.
+// BreakTestDBOutput reuses BreakTest's metric mappings, with bounded direct binary delivery.
 // Only the sender owns incarnation/sequence. An ACK is acceptance, not an fsync guarantee.
-type customGroupKey struct {
+type dbGroupKey struct {
 	time int64
 	tags *metrics.TagSet
 }
 
-type CustomOutput struct {
-	groups          map[customGroupKey]*MetricGroup
-	groupTickets    map[customGroupKey]*metrics.RequestTicket
+type BreakTestDBOutput struct {
+	groups          map[dbGroupKey]*MetricGroup
+	groupTickets    map[dbGroupKey]*metrics.RequestTicket
 	tracker         *metrics.RequestTracker
-	lanes           []*CustomOutput
-	owner           *CustomOutput
+	lanes           []*BreakTestDBOutput
+	owner           *BreakTestDBOutput
 	nextLane        int
 	watermark       int64
 	queuedWatermark int64
@@ -46,7 +46,7 @@ type CustomOutput struct {
 	sequence                         uint64
 	retryTimeout                     time.Duration
 	encoder                          *zstd.Encoder
-	queue                            chan customBatch
+	queue                            chan dbBatch
 	done, tickStop, tickDone, failed chan struct{}
 	batchMu                          sync.Mutex
 	parts                            map[string]*bytes.Buffer
@@ -59,37 +59,37 @@ type CustomOutput struct {
 	stopOnce                         sync.Once
 	stopErr                          error
 }
-type customBatch struct {
+type dbBatch struct {
 	body        []byte
 	contentType string
 	beforeUS    int64
 }
 
-// NewCustom is registered separately from timescaledb-breakingit in full and lean builds.
-func NewCustom(params output.Params) (output.Output, error) {
+// NewBreakTestDB is registered separately from timescaledb-breakingit in full and lean builds.
+func NewBreakTestDB(params output.Params) (output.Output, error) {
 	env := params.Environment
 	u, err := url.Parse(params.ConfigArgument)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, errors.New("Custom DB requires an HTTP(S) base URL without credentials, query or fragment")
+		return nil, errors.New("BreakTest DB requires an HTTP(S) base URL without credentials, query or fragment")
 	}
-	runID, token := env["runId"], env["CUSTOM_STORAGE_TOKEN"]
+	runID, token := env["runId"], env["BREAKTEST_DB_TOKEN"]
 	if !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(runID) || token == "" {
-		return nil, errors.New("Custom DB requires runId and a run-scoped CUSTOM_STORAGE_TOKEN")
+		return nil, errors.New("BreakTest DB requires runId and a run-scoped BREAKTEST_DB_TOKEN")
 	}
 	if strings.EqualFold(env["syntheticMonitoring"], "true") {
-		return nil, errors.New("Custom DB k6 output does not support synthetic monitoring")
+		return nil, errors.New("BreakTest DB k6 output does not support synthetic monitoring")
 	}
 	if strings.EqualFold(env["K6_BROWSER_SCREENSHOT_ON_ERROR"], "true") {
-		return nil, errors.New("Custom DB k6 output does not yet support browser screenshot storage")
+		return nil, errors.New("BreakTest DB k6 output does not yet support browser screenshot storage")
 	}
 	tokens := strings.Split(token, ",")
 	seen := map[string]bool{}
 	if len(tokens) > 4 {
-		return nil, errors.New("Custom DB supports 1-4 ingestion lanes")
+		return nil, errors.New("BreakTest DB supports 1-4 ingestion lanes")
 	}
 	for _, t := range tokens {
 		if t == "" || seen[t] {
-			return nil, errors.New("invalid Custom DB lane tokens")
+			return nil, errors.New("invalid BreakTest DB lane tokens")
 		}
 		seen[t] = true
 	}
@@ -111,29 +111,29 @@ func NewCustom(params output.Params) (output.Output, error) {
 	tags := map[string]string{"run_id": runID, "location": env["location"], "node_name": env["nodeName"], "scenario_name": env["scenarioName"]}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxConnsPerHost = len(tokens)
-	c := &CustomOutput{
+	c := &BreakTestDBOutput{
 		base: strings.TrimRight(u.String(), "/") + "/runs/" + runID, token: tokens[0], tokens: tokens, runID: runID,
 		client:       &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		retryTimeout: 30 * time.Second, queue: make(chan customBatch, 4), done: make(chan struct{}),
+		retryTimeout: 30 * time.Second, queue: make(chan dbBatch, 4), done: make(chan struct{}),
 		tickStop: make(chan struct{}), tickDone: make(chan struct{}), failed: make(chan struct{}), parts: map[string]*bytes.Buffer{},
 	}
-	c.groups = map[customGroupKey]*MetricGroup{}
-	c.groupTickets = map[customGroupKey]*metrics.RequestTicket{}
+	c.groups = map[dbGroupKey]*MetricGroup{}
+	c.groupTickets = map[dbGroupKey]*metrics.RequestTicket{}
 	c.mapper = &Logger{out: params.StdOut, envTags: tags, customPatterns: patterns, transactionSource: source,
 		bufHTTP: &bytes.Buffer{}, bufVUs: &bytes.Buffer{}, bufTrans: &bytes.Buffer{}, bufErrors: &bytes.Buffer{},
 		pendingHttpGroups: map[int64]*MetricGroup{}, rowSink: c.addRow}
 	return c, nil
 }
 
-func (c *CustomOutput) SetRequestTracker(t *metrics.RequestTracker) { c.tracker = t }
+func (c *BreakTestDBOutput) SetRequestTracker(t *metrics.RequestTracker) { c.tracker = t }
 
-func (c *CustomOutput) Description() string { return "custom-db-breakingit" }
-func (c *CustomOutput) SetTestRunStopCallback(callback func(error)) {
+func (c *BreakTestDBOutput) Description() string { return "breaktest-db-breakingit" }
+func (c *BreakTestDBOutput) SetTestRunStopCallback(callback func(error)) {
 	c.failureMu.Lock()
 	c.stopCallback = callback
 	c.failureMu.Unlock()
 }
-func (c *CustomOutput) err() error {
+func (c *BreakTestDBOutput) err() error {
 	if c.owner != nil {
 		return c.owner.err()
 	}
@@ -141,7 +141,7 @@ func (c *CustomOutput) err() error {
 	defer c.failureMu.Unlock()
 	return c.failure
 }
-func (c *CustomOutput) fail(err error) {
+func (c *BreakTestDBOutput) fail(err error) {
 	if c.owner != nil {
 		c.owner.fail(err)
 		return
@@ -154,7 +154,7 @@ func (c *CustomOutput) fail(err error) {
 		c.failureMu.Unlock()
 		return
 	}
-	c.failure = fmt.Errorf("CUSTOM_STORAGE_FAILED: final publication forbidden: %w", err)
+	c.failure = fmt.Errorf("BREAKTEST_DB_FAILED: final publication forbidden: %w", err)
 	failure, callback := c.failure, c.stopCallback
 	close(c.failed)
 	c.failureMu.Unlock()
@@ -163,11 +163,11 @@ func (c *CustomOutput) fail(err error) {
 		go callback(failure)
 	}
 }
-func (c *CustomOutput) Start() error {
-	c.lanes = []*CustomOutput{c}
+func (c *BreakTestDBOutput) Start() error {
+	c.lanes = []*BreakTestDBOutput{c}
 	for _, token := range c.tokens[1:] {
-		c.lanes = append(c.lanes, &CustomOutput{owner: c, tracker: c.tracker, base: c.base, runID: c.runID, token: token,
-			client: c.client, retryTimeout: c.retryTimeout, queue: make(chan customBatch, 4), done: make(chan struct{}), failed: c.failed})
+		c.lanes = append(c.lanes, &BreakTestDBOutput{owner: c, tracker: c.tracker, base: c.base, runID: c.runID, token: token,
+			client: c.client, retryTimeout: c.retryTimeout, queue: make(chan dbBatch, 4), done: make(chan struct{}), failed: c.failed})
 	}
 	for _, lane := range c.lanes {
 		if err := lane.hello(); err != nil {
@@ -178,7 +178,7 @@ func (c *CustomOutput) Start() error {
 			}
 			return err
 		}
-		encoder, err := newCustomEncoder()
+		encoder, err := newDBEncoder()
 		if err != nil {
 			return err
 		}
@@ -212,7 +212,7 @@ func (c *CustomOutput) Start() error {
 	return nil
 }
 
-func (c *CustomOutput) AddMetricSamples(samples []metrics.SampleContainer) {
+func (c *BreakTestDBOutput) AddMetricSamples(samples []metrics.SampleContainer) {
 	c.addMu.Lock()
 	defer c.addMu.Unlock()
 	if c.err() != nil {
@@ -226,7 +226,7 @@ func (c *CustomOutput) AddMetricSamples(samples []metrics.SampleContainer) {
 		}
 		for _, sample := range sc.GetSamples() {
 			if sample.Metric.Name == "browser_errors" && sample.Tags.Map()["screenshot"] != "" {
-				c.fail(errors.New("browser screenshots require a Custom DB payload integration"))
+				c.fail(errors.New("browser screenshots require a BreakTest DB payload integration"))
 				return
 			}
 		}
@@ -246,7 +246,7 @@ func (c *CustomOutput) AddMetricSamples(samples []metrics.SampleContainer) {
 				c.fail(errors.New("HTTP metrics lack producer completion tracking; live watermark would be unsafe"))
 				return
 			}
-			id := customGroupKey{sample.Time.UnixNano(), sample.Tags}
+			id := dbGroupKey{sample.Time.UnixNano(), sample.Tags}
 			if ticket != nil {
 				c.groupTickets[id] = ticket
 			}
@@ -286,7 +286,7 @@ func (c *CustomOutput) AddMetricSamples(samples []metrics.SampleContainer) {
 			}
 			n += len(g.Values) * 64
 		}
-		if len(c.groups) > 4096 || n > customBatchBytes {
+		if len(c.groups) > 4096 || n > dbBatchBytes {
 			c.fail(errors.New("incomplete metric join budget exceeded"))
 			return
 		}
@@ -295,7 +295,7 @@ func (c *CustomOutput) AddMetricSamples(samples []metrics.SampleContainer) {
 
 // Complete only after every request metric has arrived. Browser failure payloads
 // may arrive much later than duration metrics; a timer is not proof of success.
-func (c *CustomOutput) completeGroups(final bool) {
+func (c *BreakTestDBOutput) completeGroups(final bool) {
 	for key, g := range c.groups {
 		complete := true
 		for _, name := range []string{"http_req_duration", "http_req_blocked", "http_req_connecting", "http_req_tls_handshaking", "http_req_sending", "http_req_waiting", "http_req_receiving", "http_req_failed"} {
@@ -315,18 +315,18 @@ func (c *CustomOutput) completeGroups(final bool) {
 		}
 	}
 }
-func (c *CustomOutput) addRow(table string, row []string) error {
+func (c *BreakTestDBOutput) addRow(table string, row []string) error {
 	if err := c.err(); err != nil {
 		return err
 	}
-	data, err := encodeCustomRow(table, row)
+	data, err := encodeDBRow(table, row)
 	if err != nil {
 		c.fail(err)
 		return err
 	}
 	c.batchMu.Lock()
 	defer c.batchMu.Unlock()
-	if c.batchBytes+len(data) > customBatchBytes {
+	if c.batchBytes+len(data) > dbBatchBytes {
 		if err = c.enqueueLocked(); err != nil {
 			return err
 		}
@@ -338,14 +338,14 @@ func (c *CustomOutput) addRow(table string, row []string) error {
 	c.batchBytes += len(data)
 	return nil
 }
-func (c *CustomOutput) flush() {
+func (c *BreakTestDBOutput) flush() {
 	c.batchMu.Lock()
 	defer c.batchMu.Unlock()
 	if err := c.enqueueLocked(); err != nil {
 		c.fail(err)
 	}
 }
-func (c *CustomOutput) enqueueLocked() error {
+func (c *BreakTestDBOutput) enqueueLocked() error {
 	if c.batchBytes == 0 {
 		return nil
 	}
@@ -370,7 +370,7 @@ func (c *CustomOutput) enqueueLocked() error {
 	if err := writer.Close(); err != nil {
 		return err
 	}
-	batch := customBatch{body: body.Bytes(), contentType: "multipart/mixed; boundary=" + writer.Boundary()}
+	batch := dbBatch{body: body.Bytes(), contentType: "multipart/mixed; boundary=" + writer.Boundary()}
 	lane := c
 	if len(c.lanes) > 0 {
 		lane = c.lanes[c.nextLane]
@@ -385,7 +385,7 @@ func (c *CustomOutput) enqueueLocked() error {
 		return nil
 	}
 }
-func (c *CustomOutput) sender() {
+func (c *BreakTestDBOutput) sender() {
 	defer close(c.done)
 	for batch := range c.queue {
 		if c.err() != nil {
@@ -400,7 +400,7 @@ func (c *CustomOutput) sender() {
 	}
 }
 
-func (c *CustomOutput) Stop() error {
+func (c *BreakTestDBOutput) Stop() error {
 	c.stopOnce.Do(func() {
 		if !c.started {
 			return
@@ -436,7 +436,7 @@ func (c *CustomOutput) Stop() error {
 
 // Retries keep the same sequence, multipart boundary and compressed bytes.
 // Incarnation recovery is handled by the lane, after this request returns 409.
-func (c *CustomOutput) request(path string, body []byte, contentType string, seq uint64, result any) error {
+func (c *BreakTestDBOutput) request(path string, body []byte, contentType string, seq uint64, result any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.retryTimeout)
 	defer cancel()
 	for {
@@ -459,23 +459,23 @@ func (c *CustomOutput) request(path string, body []byte, contentType string, seq
 			data, readErr := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
 			_ = response.Body.Close()
 			if len(data) > 64*1024 {
-				return errors.New("oversized Custom DB acknowledgement")
+				return errors.New("oversized BreakTest DB acknowledgement")
 			}
 			if response.StatusCode == http.StatusOK && readErr == nil {
 				if err = json.Unmarshal(data, result); err != nil {
-					return errors.New("invalid Custom DB acknowledgement JSON")
+					return errors.New("invalid BreakTest DB acknowledgement JSON")
 				}
 				return nil
 			}
 			if readErr == nil && response.StatusCode != 429 && response.StatusCode < 500 {
-				return customRejection(response.StatusCode)
+				return dbRejection(response.StatusCode)
 			}
 		}
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return fmt.Errorf("Custom DB %s retry deadline: %w", path, ctx.Err())
+			return fmt.Errorf("BreakTest DB %s retry deadline: %w", path, ctx.Err())
 		case <-c.failed:
 			timer.Stop()
 			return c.err()
@@ -486,6 +486,6 @@ func (c *CustomOutput) request(path string, body []byte, contentType string, seq
 
 // The storage ingress caps zstd decoder windows at 2^18 bytes, independently
 // of the larger decoded batch budget. Enforce this even on full 2 MiB batches.
-func newCustomEncoder() (*zstd.Encoder, error) {
+func newDBEncoder() (*zstd.Encoder, error) {
 	return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(1<<18))
 }

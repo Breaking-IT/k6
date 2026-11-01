@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Isolated k6 -> Rust protocol test with the existing CSV writer as an oracle.
 
-Requires Docker, Python 3, a built k6 fork and a built Custom DB service image.
+Requires Docker, Python 3, a built k6 fork and a built BreakTest DB service image.
 Creates a temporary service/container and directory; never connects to customer DBs.
 """
 import argparse
@@ -76,14 +76,14 @@ def run(args):
         root = Path(temp)
         data_dir = root / "data"
         data_dir.mkdir()
-        env = {**os.environ, "CUSTOM_STORAGE_ADMIN_TOKEN": admin}
+        env = {**os.environ, "BREAKTEST_DB_ADMIN_TOKEN": admin}
         with socket.socket() as port_socket:
             port_socket.bind(('127.0.0.1',0))
             fixed_port=port_socket.getsockname()[1]
         try:
             subprocess.run(["docker", "run", "-d", "--name", name,
                 "--label", "breaktest.k6-writer-smoke=true", "--memory", "512m",
-                "-e", "CUSTOM_STORAGE_ADMIN_TOKEN", "-p", f"127.0.0.1:{fixed_port}:8099",
+                "-e", "BREAKTEST_DB_ADMIN_TOKEN", "-p", f"127.0.0.1:{fixed_port}:8099",
                 "-v", f"{data_dir}:/data", args.image,
                 "v3", "service", "/data", "0.0.0.0:8099"], env=env, check=True, capture_output=True)
             port = subprocess.check_output(["docker", "port", name, "8099/tcp"], text=True).strip().rsplit(":", 1)[1]
@@ -138,13 +138,13 @@ export default async function(){
 }
 """)
             target_url = f"http://127.0.0.1:{target.server_port}"
-            writer_env = {**os.environ, "CUSTOM_STORAGE_TOKEN": producer, "runId": "k6-smoke",
+            writer_env = {**os.environ, "BREAKTEST_DB_TOKEN": producer, "runId": "k6-smoke",
                 "nodeName": "k6-probe", "location": "Local", "PG_PROXY_TOKEN": "isolated-oracle",
                 "TARGET": target_url, "FIXTURE_ITERATIONS": str(args.iterations), "FIXTURE_CUSTOM": str(args.custom_metrics).lower(), "K6_NO_USAGE_REPORT": "true", "K6_HTTP_ERROR_DATA": "true"}
             for key in ("syntheticMonitoring", "K6_BROWSER_SCREENSHOT_ON_ERROR", "CUSTOM_URL_PATTERNS", "BREAKINGIT_TRANSACTION_SOURCE"):
                 writer_env.pop(key, None)
             command = [str(Path(args.k6).resolve()), "run", "--quiet",
-                "--out", "custom-db-breakingit=" + service,
+                "--out", "breaktest-db-breakingit=" + service,
                 "--out", "timescaledb-breakingit=" + target_url, str(script)]
             if args.container_image:
                 root.chmod(0o755); script.chmod(0o644)
@@ -153,8 +153,8 @@ export default async function(){
                     '-v',str(Path(args.k6).resolve())+':/usr/bin/k6:ro','-v',str(script)+':/fixture.js:ro',
                     '-e','K6_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium','-e','K6_BROWSER_ARGS=no-sandbox',
                     '-e','K6_BROWSER_HEADLESS=true',
-                    *[item for key in ('CUSTOM_STORAGE_TOKEN','runId','nodeName','location','PG_PROXY_TOKEN','TARGET','K6_NO_USAGE_REPORT','K6_HTTP_ERROR_DATA','FIXTURE_ITERATIONS','FIXTURE_CUSTOM') for item in ('-e',key)],
-                    args.container_image,'run','--quiet','--out','custom-db-breakingit='+service.replace('127.0.0.1','host.docker.internal'),
+                    *[item for key in ('BREAKTEST_DB_TOKEN','runId','nodeName','location','PG_PROXY_TOKEN','TARGET','K6_NO_USAGE_REPORT','K6_HTTP_ERROR_DATA','FIXTURE_ITERATIONS','FIXTURE_CUSTOM') for item in ('-e',key)],
+                    args.container_image,'run','--quiet','--out','breaktest-db-breakingit='+service.replace('127.0.0.1','host.docker.internal'),
                     '--out','timescaledb-breakingit='+target_url.replace('127.0.0.1','host.docker.internal'),'/fixture.js']
             observations=[]
             with (root/'k6.log').open('w+') as log:
@@ -174,7 +174,7 @@ export default async function(){
                         time.sleep(.1)
                     log.seek(0)
                     text=log.read()
-                    assert process.returncode==0 and 'CUSTOM_STORAGE_FAILED' not in text,text
+                    assert process.returncode==0 and 'BREAKTEST_DB_FAILED' not in text,text
                 finally:
                     if process.poll() is None: process.kill(); process.wait()
             live=[s for s in observations if all(not x['finished'] for x in s['sources']) and min(x['watermark'] for x in s['sources'])>origin and any(r['complete'] for r in s['rows'])]
