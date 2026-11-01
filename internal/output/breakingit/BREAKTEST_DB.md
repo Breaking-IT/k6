@@ -35,7 +35,7 @@ connect times become NULL. Error UUIDs are generated independently per output.
 
 The application selects the output from the frozen test backend, provisions all
 lane tokens, and finalizes only after every lane finishes. BreakTest's integration
-requires generator capability `k6-custom-v2`, verified against the installed binary
+requires generator capability `k6-breaktest-db-v1`, verified against the installed binary
 checksum; this prevents routing multi-lane jobs to the older single-source writer.
 Generator machine statistics remain the responsibility of the existing agent.
 
@@ -107,12 +107,12 @@ also fails the output, rather than storing a dangling screenshot reference.
 
 ```sh
 go test -race ./metrics ./output ./lib/netext/httpext ./internal/output/breakingit
-go test -tags lean ./internal/cmd -run 'TestBuiltinOutputString|TestCustomDBAndTimescaleConstructors'
-go test ./internal/cmd -run 'TestBuiltinOutputString|TestCustomDBAndTimescaleConstructors'
-go build -tags lean -o /tmp/k6-custom-db-writer .
-python3 ai-tests/breaktest-db/smoke.py --k6 /tmp/k6-custom-db-writer \
+go test -tags lean ./internal/cmd -run 'TestBuiltinOutputString|TestBreakTestDBAndTimescaleConstructors'
+go test ./internal/cmd -run 'TestBuiltinOutputString|TestBreakTestDBAndTimescaleConstructors'
+go build -tags lean -o /tmp/k6-breaktest-db-writer .
+python3 ai-tests/breaktest-db/smoke.py --k6 /tmp/k6-breaktest-db-writer \
   --image breaktest-storage-lab:local --lanes 4
-python3 ai-tests/breaktest-db/smoke.py --k6 /tmp/k6-custom-db-writer --lanes 4 --restart-live
+python3 ai-tests/breaktest-db/smoke.py --k6 /tmp/k6-breaktest-db-writer --lanes 4 --restart-live
 ```
 
 The smoke test creates its own disposable Docker service and temporary directory,

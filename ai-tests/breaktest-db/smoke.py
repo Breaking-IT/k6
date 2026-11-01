@@ -26,7 +26,7 @@ from datetime import datetime
 
 
 def run(args):
-    name = "k6-custom-writer-smoke-" + uuid.uuid4().hex[:12]
+    name = "k6-breaktest-db-smoke-" + uuid.uuid4().hex[:12]
     admin = secrets.token_hex(32)
     producers = [secrets.token_hex(32) for _ in range(args.lanes)]
     producer = ",".join(producers)
@@ -85,7 +85,7 @@ def run(args):
                 "--label", "breaktest.k6-writer-smoke=true", "--memory", "512m",
                 "-e", "BREAKTEST_DB_ADMIN_TOKEN", "-p", f"127.0.0.1:{fixed_port}:8099",
                 "-v", f"{data_dir}:/data", args.image,
-                "v3", "service", "/data", "0.0.0.0:8099"], env=env, check=True, capture_output=True)
+                "serve", "/data", "0.0.0.0:8099"], env=env, check=True, capture_output=True)
             port = subprocess.check_output(["docker", "port", name, "8099/tcp"], text=True).strip().rsplit(":", 1)[1]
             service = f"http://127.0.0.1:{port}"
 
@@ -242,7 +242,7 @@ export default async function(){
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--k6", required=True)
-    parser.add_argument("--image", default="breaktest-storage-lab:local")
+    parser.add_argument("--image", default="breaktest-db:local")
     parser.add_argument('--lanes',type=int,choices=range(1,5),default=1)
     parser.add_argument('--iterations',type=int,default=80)
     parser.add_argument('--restart-live',action='store_true')
