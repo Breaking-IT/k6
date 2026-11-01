@@ -457,7 +457,7 @@ func TestUntrackedRequestCannotCrossNativeWatermark(t *testing.T) {
 	tracker, release := metrics.BindRequestTracker(channel)
 	defer release()
 	c.tracker = tracker
-	c.AddMetricSamples([]metrics.SampleContainer{transactionTestSample("db_missing_hook", nil, false)})
+	c.AddMetricSamples([]metrics.SampleContainer{transactionTestSample("custom_missing_hook", nil, false)})
 	require.ErrorContains(t, c.err(), "lacks producer completion tracking")
 	require.Empty(t, c.parts)
 }
