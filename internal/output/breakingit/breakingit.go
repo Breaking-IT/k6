@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -70,13 +69,16 @@ type Logger struct {
 	httpClient *http.Client
 
 	// batch buffers
-	mu         sync.Mutex
-	bufHTTP    *bytes.Buffer
-	bufVUs     *bytes.Buffer
-	bufTrans   *bytes.Buffer
-	bufErrors  *bytes.Buffer
-	batchTimer *time.Timer
-	flushing   bool // flag to prevent recursive flush calls
+	mu          sync.Mutex
+	bufHTTP     *bytes.Buffer
+	bufVUs      *bytes.Buffer
+	bufTrans    *bytes.Buffer
+	bufErrors   *bytes.Buffer
+	batchTimer  *time.Timer
+	firstData   chan struct{}
+	firstQueued bool
+	cleanupDone chan struct{}
+	flushing    bool // flag to prevent recursive flush calls
 
 	// pending screenshots to upsert via /upsert endpoint (low-volume)
 	pendingScreenshots [][]any
@@ -169,6 +171,8 @@ func New(params output.Params) (output.Output, error) {
 		isSynthetic:       isSynthetic,
 		transactionSource: transactionSource,
 	}
+	l.firstData = make(chan struct{}, 1)
+	l.cleanupDone = make(chan struct{})
 	l.batchTimer = time.NewTimer(time.Second)
 	go l.batchLoop()
 	go l.cleanupProcessor()
@@ -183,33 +187,36 @@ func (l *Logger) Start() error { return nil }
 
 // Stop flushes remaining samples and stops background processing.
 func (l *Logger) Stop() error {
-	_, _ = fmt.Fprintf(l.out, "[screenshot] Stop() called, waiting for batchLoop to finish\n")
-	l.batchTimer.Stop()
 	close(l.cleanupStop)
-	// Wait for any in-progress batchLoop flush to complete
+	<-l.cleanupDone
 	<-l.batchDone
-	_, _ = fmt.Fprintf(l.out, "[screenshot] batchLoop done, running final flush (pendingScreenshots=%d)\n",
-		len(l.pendingScreenshots))
-	// Final flush to send any remaining data (including screenshots)
+	// Finish incomplete groups before the final batch.
+	for _, g := range l.pendingHTTPGroups {
+		l.processHTTPGroup(g)
+	}
 	l.flush()
-	_, _ = fmt.Fprintf(l.out, "[screenshot] Stop() complete\n")
 	return nil
 }
 
 func (l *Logger) batchLoop() {
 	defer close(l.batchDone)
-	for {
+	defer l.batchTimer.Stop()
+	select {
+	case <-l.firstData:
+	case <-l.cleanupStop:
+		return
+	}
+	if !l.batchTimer.Stop() {
 		select {
-		case _, ok := <-l.batchTimer.C:
-			if !ok {
-				return
-			}
-			l.flush()
-			if l.isSynthetic {
-				l.batchTimer.Reset(5 * time.Second)
-			} else {
-				l.batchTimer.Reset(time.Second)
-			}
+		case <-l.batchTimer.C:
+		default:
+		}
+	}
+	for {
+		l.flush()
+		l.batchTimer.Reset(time.Second)
+		select {
+		case <-l.batchTimer.C:
 		case <-l.cleanupStop:
 			return
 		}
@@ -217,6 +224,7 @@ func (l *Logger) batchLoop() {
 }
 
 func (l *Logger) cleanupProcessor() {
+	defer close(l.cleanupDone)
 	t := time.NewTicker(100 * time.Millisecond)
 	defer t.Stop()
 	for {
@@ -255,19 +263,13 @@ func (l *Logger) flush() {
 		return
 	}
 
-	// Snapshot buffer data and lengths for retry attempts
-	bufHTTPSnapshot := make([]byte, l.bufHTTP.Len())
-	copy(bufHTTPSnapshot, l.bufHTTP.Bytes())
-	bufHTTPLen := l.bufHTTP.Len()
-	bufVUsSnapshot := make([]byte, l.bufVUs.Len())
-	copy(bufVUsSnapshot, l.bufVUs.Bytes())
-	bufVUsLen := l.bufVUs.Len()
-	bufTransSnapshot := make([]byte, l.bufTrans.Len())
-	copy(bufTransSnapshot, l.bufTrans.Bytes())
-	bufTransLen := l.bufTrans.Len()
-	bufErrorsSnapshot := make([]byte, l.bufErrors.Len())
-	copy(bufErrorsSnapshot, l.bufErrors.Bytes())
-	bufErrorsLen := l.bufErrors.Len()
+	// Transfer ownership so producers can fill the next batch during network I/O.
+	bufHTTPSnapshot := l.bufHTTP.Bytes()
+	bufVUsSnapshot := l.bufVUs.Bytes()
+	bufTransSnapshot := l.bufTrans.Bytes()
+	bufErrorsSnapshot := l.bufErrors.Bytes()
+	l.bufHTTP, l.bufVUs = &bytes.Buffer{}, &bytes.Buffer{}
+	l.bufTrans, l.bufErrors = &bytes.Buffer{}, &bytes.Buffer{}
 	// Snapshot pending screenshots
 	screenshotsSnapshot := l.pendingScreenshots
 	l.pendingScreenshots = nil
@@ -290,38 +292,10 @@ func (l *Logger) flush() {
 	}
 
 	body, boundary := l.batchBody(bufHTTPSnapshot, bufVUsSnapshot, bufTransSnapshot, bufErrorsSnapshot)
-	success := l.sendBatch(body, boundary)
-
-	// Reset buffers and check for new data that accumulated during retries
+	l.sendBatch(body, boundary)
 	l.mu.Lock()
-	hasNewData := false
-	for _, item := range []struct {
-		buffer *bytes.Buffer
-		sent   int
-	}{
-		{l.bufHTTP, bufHTTPLen},
-		{l.bufVUs, bufVUsLen},
-		{l.bufTrans, bufTransLen},
-		{l.bufErrors, bufErrorsLen},
-	} {
-		if success {
-			item.buffer.Next(item.sent)
-			hasNewData = hasNewData || item.buffer.Len() > 0
-		} else {
-			// Preserve the existing bounded-memory policy after exhausted retries.
-			item.buffer.Reset()
-		}
-	}
-
 	l.flushing = false
 	l.mu.Unlock()
-
-	// If new data accumulated during retries and we succeeded, flush immediately to send it
-	// This ensures no gap in data delivery
-	if success && hasNewData {
-		// Use a goroutine to avoid blocking and prevent potential deadlock
-		go l.flush()
-	}
 }
 
 // upsertScreenshots sends screenshots to the pg-proxy upsert endpoint.
@@ -464,16 +438,16 @@ func (l *Logger) processHTTPGroup(g *MetricGroup) {
 
 	// response_size from browser_data_received when present (browser only); k6 HTTP has no per-request
 	// size in this group
-	responseSize := ""
+	var responseSize any = ""
 	if v, ok := g.Values["data_received"]; ok && v >= 0 {
-		responseSize = fmtInt(v)
+		responseSize = int64(v)
 	}
 
-	var row []string
+	var row []any
 	if l.isSynthetic {
 		// SM table has run_id last (existing table order)
-		row = []string{
-			time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, g.Timestamp),
 			g.Tags["scenario_name"],
 			g.Tags["location"],
 			g.Tags["node_name"],
@@ -490,8 +464,8 @@ func (l *Logger) processHTTPGroup(g *MetricGroup) {
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 		}
 	} else {
-		row = []string{
-			time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, g.Timestamp),
 			g.Tags["run_id"],
 			g.Tags["location"],
 			transactionName,
@@ -506,9 +480,7 @@ func (l *Logger) processHTTPGroup(g *MetricGroup) {
 		}
 	}
 	l.mu.Lock()
-	w := csv.NewWriter(l.bufHTTP)
-	_ = w.Write(row)
-	w.Flush()
+	l.writeBinaryRow(l.bufHTTP, row)
 	// If not successful, also emit into requests_error(_sm)
 	if success == "false" {
 		l.writeHTTPError(g, transactionName, samplerName, responseCode, responseTime, connectTime, isBrowser)
@@ -548,13 +520,13 @@ func (l *Logger) processWebSocketMetric(s metrics.Sample, ts int64) {
 	}
 
 	// response_time is the metric value
-	responseTime := fmtInt(s.Value)
+	responseTime := int64(s.Value)
 
-	var row []string
+	var row []any
 	if l.isSynthetic {
 		// SM requests_raw_sm (existing table: run_id last)
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			tags["scenario_name"],
 			tags["location"],
 			tags["node_name"],
@@ -573,8 +545,8 @@ func (l *Logger) processWebSocketMetric(s metrics.Sample, ts int64) {
 	} else {
 		// Non-SM: time, run_id, location, transaction_name, sampler_name, success, request_size,
 		// response_size, response_code, response_connect_time, response_latency, response_time
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			tags["run_id"],
 			tags["location"],
 			transactionName,
@@ -589,9 +561,7 @@ func (l *Logger) processWebSocketMetric(s metrics.Sample, ts int64) {
 		}
 	}
 	l.mu.Lock()
-	w := csv.NewWriter(l.bufHTTP)
-	_ = w.Write(row)
-	w.Flush()
+	l.writeBinaryRow(l.bufHTTP, row)
 	l.mu.Unlock()
 }
 
@@ -632,13 +602,13 @@ func (l *Logger) processCustomTrendMetric(s metrics.Sample, ts int64) {
 	success := "true"
 
 	// response_time is the metric value
-	responseTime := fmtInt(s.Value)
+	responseTime := int64(s.Value)
 
-	var row []string
+	var row []any
 	if l.isSynthetic {
 		// SM requests_raw_sm (existing table: run_id last)
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			tags["scenario_name"],
 			tags["location"],
 			tags["node_name"],
@@ -657,8 +627,8 @@ func (l *Logger) processCustomTrendMetric(s metrics.Sample, ts int64) {
 	} else {
 		// Non-SM: time, run_id, location, transaction_name, sampler_name, success, request_size,
 		// response_size, response_code, response_connect_time, response_latency, response_time
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			tags["run_id"],
 			tags["location"],
 			transactionName,
@@ -673,9 +643,7 @@ func (l *Logger) processCustomTrendMetric(s metrics.Sample, ts int64) {
 		}
 	}
 	l.mu.Lock()
-	w := csv.NewWriter(l.bufHTTP)
-	_ = w.Write(row)
-	w.Flush()
+	l.writeBinaryRow(l.bufHTTP, row)
 	l.mu.Unlock()
 }
 
@@ -721,11 +689,11 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 	// captured in the same flush snapshot (prevents the error row referencing
 	// a hash that was never sent to sm_screenshots).
 	if l.isSynthetic {
-		row := []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano), // time
-			fmt.Sprintf("%v", l.envTags["scenario_name"]),   // scenario_name
-			fmt.Sprintf("%v", l.envTags["location"]),        // location
-			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
+		row := []any{
+			time.Unix(0, ts), // time
+			fmt.Sprintf("%v", l.envTags["scenario_name"]), // scenario_name
+			fmt.Sprintf("%v", l.envTags["location"]),      // location
+			fmt.Sprintf("%v", l.envTags["node_name"]),     // node_name
 			m["scenario"],                          // thread_group_name
 			transactionName,                        // transaction_name
 			samplerName,                            // sampler_name
@@ -748,28 +716,26 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 			})
 			_, _ = fmt.Fprintf(l.out, "[screenshot] queued for upsert, pendingScreenshots=%d\n", len(l.pendingScreenshots))
 		}
-		we := csv.NewWriter(l.bufErrors)
-		_ = we.Write(row)
-		we.Flush()
+		l.writeBinaryRow(l.bufErrors, row)
 		l.mu.Unlock()
 	} else {
-		row := []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano), // time
-			fmt.Sprintf("%v", l.envTags["run_id"]),          // run_id
-			fmt.Sprintf("%v", l.envTags["location"]),        // location
-			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
-			transactionName, // transaction_name
-			samplerName,     // sampler_name
-			"",              // response_code
-			"",              // response_time
-			"",              // connection_time
-			"",              // url
-			"",              // assertions
-			errMsg,          // response_message
-			"",              // request_headers
-			"",              // response_headers
-			screenshotHash,  // response_data (screenshot hash reference)
-			id,              // id (UUIDv7)
+		row := []any{
+			time.Unix(0, ts),                          // time
+			fmt.Sprintf("%v", l.envTags["run_id"]),    // run_id
+			fmt.Sprintf("%v", l.envTags["location"]),  // location
+			fmt.Sprintf("%v", l.envTags["node_name"]), // node_name
+			transactionName,                           // transaction_name
+			samplerName,                               // sampler_name
+			"",                                        // response_code
+			"",                                        // response_time
+			"",                                        // connection_time
+			"",                                        // url
+			"",                                        // assertions
+			errMsg,                                    // response_message
+			"",                                        // request_headers
+			"",                                        // response_headers
+			screenshotHash,                            // response_data (screenshot hash reference)
+			id,                                        // id (UUIDv7)
 		}
 		l.mu.Lock()
 		if screenshotHash != "" {
@@ -777,14 +743,10 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 				screenshotHash, screenshot, "image/png", len(screenshot),
 			})
 		}
-		we := csv.NewWriter(l.bufErrors)
-		_ = we.Write(row)
-		we.Flush()
+		l.writeBinaryRow(l.bufErrors, row)
 		l.mu.Unlock()
 	}
 }
-
-func fmtInt(v float64) string { return fmt.Sprintf("%d", int64(v)) }
 
 // generateUUIDv7 generates a UUIDv7 using the provided timestamp (nanoseconds since Unix epoch)
 func generateUUIDv7(timestampNanos int64) string {
@@ -997,10 +959,10 @@ func (l *Logger) processPageSample(s metrics.Sample, ts int64) {
 	// SM transactions_sm (run_id last): time, scenario_name, location, node_name, thread_group_name,
 	// transaction_name, success, request_size, response_size, response_time, run_id
 	isSM := l.isSynthetic
-	var row []string
+	var row []any
 	if isSM {
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			fmt.Sprintf("%v", l.envTags["scenario_name"]),
 			fmt.Sprintf("%v", l.envTags["location"]),
 			fmt.Sprintf("%v", l.envTags["node_name"]),
@@ -1009,25 +971,23 @@ func (l *Logger) processPageSample(s metrics.Sample, ts int64) {
 			"true",
 			"",
 			"",
-			fmtInt(s.Value),
+			int64(s.Value),
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 		}
 	} else {
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 			fmt.Sprintf("%v", l.envTags["location"]),
 			transactionName,
 			"true",
 			"",
 			"",
-			fmtInt(s.Value),
+			int64(s.Value),
 		}
 	}
 	l.mu.Lock()
-	wt := csv.NewWriter(l.bufTrans)
-	_ = wt.Write(row)
-	wt.Flush()
+	l.writeBinaryRow(l.bufTrans, row)
 	l.mu.Unlock()
 }
 
@@ -1044,11 +1004,11 @@ func (l *Logger) processGroupSample(s metrics.Sample, ts int64) {
 		nameRaw = "/"
 	}
 	isSM := l.isSynthetic
-	var row []string
+	var row []any
 	if isSM {
 		// SM transactions_sm (run_id last)
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			fmt.Sprintf("%v", l.envTags["scenario_name"]),
 			fmt.Sprintf("%v", l.envTags["location"]),
 			fmt.Sprintf("%v", l.envTags["node_name"]),
@@ -1057,42 +1017,38 @@ func (l *Logger) processGroupSample(s metrics.Sample, ts int64) {
 			success,
 			"",
 			"",
-			fmtInt(s.Value),
+			int64(s.Value),
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 		}
 	} else {
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 			fmt.Sprintf("%v", l.envTags["location"]),
 			nameRaw,
 			success,
 			"",
 			"",
-			fmtInt(s.Value),
+			int64(s.Value),
 		}
 	}
 	l.mu.Lock()
-	wt := csv.NewWriter(l.bufTrans)
-	_ = wt.Write(row)
-	wt.Flush()
+	l.writeBinaryRow(l.bufTrans, row)
 	l.mu.Unlock()
 }
 
 func (l *Logger) processVUsSample(s metrics.Sample, ts int64) {
-	row := []string{
-		time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+	row := []any{
+		time.Unix(0, ts),
 		fmt.Sprintf("%v", l.envTags["run_id"]),
 		fmt.Sprintf("%v", l.envTags["location"]),
 		fmt.Sprintf("%v", l.envTags["node_name"]),
-		fmt.Sprintf("%d", int64(s.Value)), // active_threads
-		"",                                // started_threads (unknown)
-		"",                                // finished_threads (unknown)
+		int64(s.Value), // active_threads
+		"",             // started_threads (unknown)
+		"",             // finished_threads (unknown)
 	}
 	l.mu.Lock()
-	wv := csv.NewWriter(l.bufVUs)
-	_ = wv.Write(row)
-	wv.Flush()
+	l.writeBinaryRow(l.bufVUs, row)
 	l.mu.Unlock()
 }
 
@@ -1125,11 +1081,11 @@ func (l *Logger) processCheckSample(s metrics.Sample, ts int64) {
 	// Build row per schema (includes id field)
 	if l.isSynthetic {
 		// SM requests_error_sm (existing table: run_id last): time, scenario_name, ..., id, run_id
-		row := []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano), // time
-			fmt.Sprintf("%v", l.envTags["scenario_name"]),   // scenario_name
-			fmt.Sprintf("%v", l.envTags["location"]),        // location
-			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
+		row := []any{
+			time.Unix(0, ts), // time
+			fmt.Sprintf("%v", l.envTags["scenario_name"]), // scenario_name
+			fmt.Sprintf("%v", l.envTags["location"]),      // location
+			fmt.Sprintf("%v", l.envTags["node_name"]),     // node_name
 			m["scenario"],                          // thread_group_name
 			transactionName,                        // transaction_name
 			samplerName,                            // sampler_name
@@ -1146,33 +1102,29 @@ func (l *Logger) processCheckSample(s metrics.Sample, ts int64) {
 			fmt.Sprintf("%v", l.envTags["run_id"]), // run_id last
 		}
 		l.mu.Lock()
-		we := csv.NewWriter(l.bufErrors)
-		_ = we.Write(row)
-		we.Flush()
+		l.writeBinaryRow(l.bufErrors, row)
 		l.mu.Unlock()
 	} else {
-		row := []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano), // time
-			fmt.Sprintf("%v", l.envTags["run_id"]),          // run_id
-			fmt.Sprintf("%v", l.envTags["location"]),        // location
-			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
-			transactionName, // transaction_name
-			samplerName,     // sampler_name
-			responseCode,    // response_code
-			responseTime,    // response_time
-			"",              // connection_time
-			url,             // url
-			"",              // assertions
-			checkMsg,        // response_message
-			requestData,     // request_headers (used for request data)
-			"",              // response_headers
-			responseData,    // response_data
-			id,              // id (UUIDv7 generated from measurement timestamp)
+		row := []any{
+			time.Unix(0, ts),                          // time
+			fmt.Sprintf("%v", l.envTags["run_id"]),    // run_id
+			fmt.Sprintf("%v", l.envTags["location"]),  // location
+			fmt.Sprintf("%v", l.envTags["node_name"]), // node_name
+			transactionName,                           // transaction_name
+			samplerName,                               // sampler_name
+			responseCode,                              // response_code
+			responseTime,                              // response_time
+			"",                                        // connection_time
+			url,                                       // url
+			"",                                        // assertions
+			checkMsg,                                  // response_message
+			requestData,                               // request_headers (used for request data)
+			"",                                        // response_headers
+			responseData,                              // response_data
+			id,                                        // id (UUIDv7 generated from measurement timestamp)
 		}
 		l.mu.Lock()
-		we := csv.NewWriter(l.bufErrors)
-		_ = we.Write(row)
-		we.Flush()
+		l.writeBinaryRow(l.bufErrors, row)
 		l.mu.Unlock()
 	}
 }
@@ -1180,8 +1132,9 @@ func (l *Logger) processCheckSample(s metrics.Sample, ts int64) {
 func (l *Logger) batchBody(
 	bufHTTPSnapshot, bufVUsSnapshot, bufTransSnapshot, bufErrorsSnapshot []byte,
 ) ([]byte, string) {
-	var body bytes.Buffer
-	mw := multipart.NewWriter(&body)
+	var gzBody bytes.Buffer
+	gz, _ := gzip.NewWriterLevel(&gzBody, gzip.BestSpeed)
+	mw := multipart.NewWriter(gz)
 
 	if len(bufHTTPSnapshot) > 0 {
 		h := make(textproto.MIMEHeader)
@@ -1190,16 +1143,20 @@ func (l *Logger) batchBody(
 			table = "public.requests_raw_sm"
 		}
 		h.Set("X-Table", table)
-		h.Set("X-Format", "csv")
+		h.Set("X-Format", "binary")
 		pw, _ := mw.CreatePart(h)
-		_, _ = io.Copy(pw, bytes.NewReader(bufHTTPSnapshot))
+		_, _ = pw.Write([]byte(binaryCopyHeader))
+		_, _ = pw.Write(bufHTTPSnapshot)
+		_, _ = pw.Write([]byte{0xff, 0xff})
 	}
 	if len(bufVUsSnapshot) > 0 && !l.isSynthetic {
 		h := make(textproto.MIMEHeader)
 		h.Set("X-Table", "public.virtual_users")
-		h.Set("X-Format", "csv")
+		h.Set("X-Format", "binary")
 		pw, _ := mw.CreatePart(h)
-		_, _ = io.Copy(pw, bytes.NewReader(bufVUsSnapshot))
+		_, _ = pw.Write([]byte(binaryCopyHeader))
+		_, _ = pw.Write(bufVUsSnapshot)
+		_, _ = pw.Write([]byte{0xff, 0xff})
 	}
 	if len(bufTransSnapshot) > 0 {
 		h := make(textproto.MIMEHeader)
@@ -1208,9 +1165,11 @@ func (l *Logger) batchBody(
 			table = "public.transactions_sm"
 		}
 		h.Set("X-Table", table)
-		h.Set("X-Format", "csv")
+		h.Set("X-Format", "binary")
 		pw, _ := mw.CreatePart(h)
-		_, _ = io.Copy(pw, bytes.NewReader(bufTransSnapshot))
+		_, _ = pw.Write([]byte(binaryCopyHeader))
+		_, _ = pw.Write(bufTransSnapshot)
+		_, _ = pw.Write([]byte{0xff, 0xff})
 	}
 	if len(bufErrorsSnapshot) > 0 {
 		h := make(textproto.MIMEHeader)
@@ -1219,16 +1178,14 @@ func (l *Logger) batchBody(
 			table = "public.requests_error_sm"
 		}
 		h.Set("X-Table", table)
-		h.Set("X-Format", "csv")
+		h.Set("X-Format", "binary")
 		pw, _ := mw.CreatePart(h)
-		_, _ = io.Copy(pw, bytes.NewReader(bufErrorsSnapshot))
+		_, _ = pw.Write([]byte(binaryCopyHeader))
+		_, _ = pw.Write(bufErrorsSnapshot)
+		_, _ = pw.Write([]byte{0xff, 0xff})
 	}
 	_ = mw.Close()
 
-	// gzip body
-	var gzBody bytes.Buffer
-	gz := gzip.NewWriter(&gzBody)
-	_, _ = gz.Write(body.Bytes())
 	_ = gz.Close()
 
 	return gzBody.Bytes(), mw.Boundary()
@@ -1276,7 +1233,7 @@ func (l *Logger) postBatch(body []byte, boundary string) error {
 
 // writeHTTPError requires the buffer lock to be held by the caller.
 func (l *Logger) writeHTTPError(g *MetricGroup,
-	transactionName, samplerName, responseCode, responseTime, connectTime string, isBrowser bool,
+	transactionName, samplerName, responseCode string, responseTime, connectTime int64, isBrowser bool,
 ) {
 	// Build response_message from tags
 	errText := fmt.Sprintf("%v", g.Tags["error"]) // may be empty
@@ -1326,8 +1283,8 @@ func (l *Logger) writeHTTPError(g *MetricGroup,
 	id := generateUUIDv7(g.Timestamp)
 	if l.isSynthetic {
 		// SM requests_error_sm (existing table: run_id last): time, scenario_name, ..., id, run_id
-		erow := []string{
-			time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
+		erow := []any{
+			time.Unix(0, g.Timestamp),
 			g.Tags["scenario_name"],
 			g.Tags["location"],
 			g.Tags["node_name"],
@@ -1346,12 +1303,10 @@ func (l *Logger) writeHTTPError(g *MetricGroup,
 			id,                // id (UUIDv7)
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 		}
-		we := csv.NewWriter(l.bufErrors)
-		_ = we.Write(erow)
-		we.Flush()
+		l.writeBinaryRow(l.bufErrors, erow)
 	} else {
-		erow := []string{
-			time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
+		erow := []any{
+			time.Unix(0, g.Timestamp),
 			g.Tags["run_id"],
 			g.Tags["location"],
 			g.Tags["node_name"],
@@ -1368,9 +1323,7 @@ func (l *Logger) writeHTTPError(g *MetricGroup,
 			g.ErrorResBody,    // response_data
 			id,                // id (UUIDv7)
 		}
-		we := csv.NewWriter(l.bufErrors)
-		_ = we.Write(erow)
-		we.Flush()
+		l.writeBinaryRow(l.bufErrors, erow)
 	}
 }
 
@@ -1464,9 +1417,9 @@ func parseCustomPatterns(out io.Writer, patterns string) map[string]string {
 }
 
 // requestTimings converts k6 timings to the JMeter-style fields expected by BreakTest.
-func requestTimings(values map[string]float64) (connectTime, latency, responseTime string) {
+func requestTimings(values map[string]float64) (connectTime, latency, responseTime int64) {
 	connect := values["http_req_connecting"] + values["http_req_tls_handshaking"]
-	return fmtInt(connect),
-		fmtInt(connect + values["http_req_sending"] + values["http_req_waiting"]),
-		fmtInt(connect + values["http_req_duration"])
+	return int64(connect),
+		int64(connect + values["http_req_sending"] + values["http_req_waiting"]),
+		int64(connect + values["http_req_duration"])
 }

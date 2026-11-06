@@ -54,10 +54,12 @@ func TestBatchRetryPreservesConcurrentSamples(t *testing.T) {
 	defer server.Close()
 	logger.proxyURL, logger.httpClient = server.URL, server.Client()
 	logger.flush()
+	require.Len(t, requests, 2)
+	logger.flush()
 	for _, want := range []string{"original\n", "original\n", "arrived during retry\n"} {
 		select {
 		case got := <-requests:
-			assert.Equal(t, want, got)
+			assert.Equal(t, binaryCopyHeader+want+"\xff\xff", got)
 		case <-time.After(5 * time.Second):
 			t.Fatal("missing batch")
 		}

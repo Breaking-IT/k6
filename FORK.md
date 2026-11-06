@@ -60,6 +60,9 @@ git pull --ff-only origin master
 The build script reads the source in the current checkout and writes Linux and macOS binaries for
 amd64 and arm64 into `dist/`. It does not install or deploy them. Its displayed `VERSION` value is
 informational; use the binary's `version` command and SHA-256 checksum to identify an artifact.
+Filenames include the build-start timestamp in UTC after `-breakingit`, for example
+`k6-linux-amd64-breakingit-20261013T143000Z`. All four binaries from one invocation share the
+same timestamp.
 
 For the complete change history, compare the `master` branch with the upstream
 [grafana/k6](https://github.com/grafana/k6) repository.

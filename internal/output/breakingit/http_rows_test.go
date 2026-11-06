@@ -1,7 +1,6 @@
 package breakingit
 
 import (
-	"encoding/csv"
 	"fmt"
 	"testing"
 	"time"
@@ -32,7 +31,7 @@ func TestFailedHTTPRows(t *testing.T) {
 				ErrorReqHeaders: "POST /pay", ErrorReqBody: "payload",
 				ErrorResHeaders: "HTTP/1.1 500", ErrorResBody: "failure",
 			})
-			requests, err := csv.NewReader(logger.bufHTTP).ReadAll()
+			requests, err := readBinaryRows(logger.bufHTTP, map[bool]string{false: "tssssbiisiii", true: "tssssssbiisiiiu"}[logger.isSynthetic], false)
 			require.NoError(t, err)
 			require.Len(t, requests, 1)
 			offset := 3
@@ -41,7 +40,7 @@ func TestFailedHTTPRows(t *testing.T) {
 			}
 			assert.Equal(t, []string{"Checkout", "/pay", "false", "", "", "500", "5", "14", "25"},
 				requests[0][offset:offset+9])
-			errors, err := csv.NewReader(logger.bufErrors).ReadAll()
+			errors, err := readBinaryRows(logger.bufErrors, map[bool]string{false: "tssssssiissssssu", true: "tsssssssiissssssuu"}[logger.isSynthetic], false)
 			require.NoError(t, err)
 			require.Len(t, errors, 1)
 			offset = 4
