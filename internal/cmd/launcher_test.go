@@ -444,6 +444,9 @@ func TestGetProviderConfig(t *testing.T) {
 			}
 
 			config := getProviderConfig(ts.GlobalState)
+			if leanBuild {
+				tc.expectConfig.BuildServiceAuth = ""
+			}
 
 			assert.Equal(t, tc.expectConfig, config)
 		})

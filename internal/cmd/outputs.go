@@ -119,6 +119,8 @@ func createOutputs(
 			}
 		}
 
+		attachCloudLogDrainer(out, gs)
+
 		result = append(result, out)
 	}
 

@@ -1,0 +1,51 @@
+name: Lean CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build lean release binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: ./build-linux-binaries.sh
+
+  test:
+    name: Test lean fork
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Run lean CLI, runtime, transport and output tests
+        run: |
+          go test -race -tags lean -p 2 -parallel 2 -timeout 15m \
+            ./internal/cmd ./internal/cmd/tests ./internal/api ./internal/js ./internal/features \
+            ./internal/js/modules/k6 ./internal/output/breakingit ./lib/netext/httpext ./metrics ./output
+      - name: Run Chromium group regression tests
+        env:
+          K6_BROWSER_EXECUTABLE_PATH: /usr/bin/google-chrome
+          K6_BROWSER_ARGS: no-sandbox
+        run: |
+          go test -race -tags lean -parallel 1 -timeout 15m \
+            -run '^(TestAsyncGroup|TestBrowserGroupTransactionOutcomes)' ./internal/js/modules/k6/browser/tests

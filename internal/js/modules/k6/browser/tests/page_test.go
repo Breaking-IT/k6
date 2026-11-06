@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,11 +31,6 @@ import (
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/k6ext/k6test"
 	k6metrics "go.k6.io/k6/v2/metrics"
 )
-
-type jsFrameBaseOpts struct {
-	Timeout string
-	Strict  bool
-}
 
 const sampleHTML = `<div><b>Test</b><ol><li><i>One</i></li></ol></div>`
 
@@ -440,7 +436,7 @@ func TestPageInnerHTML(t *testing.T) {
 		err := p.SetContent(sampleHTML, nil)
 		require.NoError(t, err)
 		popts := common.NewFrameInnerHTMLOptions(p.MainFrame().Timeout())
-		require.NoError(t, popts.Parse(tb.vu.Context(), tb.toSobekValue(jsFrameBaseOpts{Timeout: "100"})))
+		popts.Timeout = 100 * time.Millisecond
 		_, err = p.InnerHTML("p", popts)
 		require.Error(t, err)
 	})
@@ -478,7 +474,7 @@ func TestPageInnerText(t *testing.T) {
 		require.NoError(t, err)
 
 		popts := common.NewFrameInnerTextOptions(p.MainFrame().Timeout())
-		require.NoError(t, popts.Parse(tb.vu.Context(), tb.toSobekValue(jsFrameBaseOpts{Timeout: "100"})))
+		popts.Timeout = 100 * time.Millisecond
 		_, err = p.InnerText("p", popts)
 		require.Error(t, err)
 	})
@@ -678,6 +674,16 @@ func TestPageSetChecked(t *testing.T) {
 	assert.False(t, checked)
 }
 
+type timeoutScreenshotPersister struct {
+	called bool
+}
+
+func (p *timeoutScreenshotPersister) Persist(ctx context.Context, _ string, _ io.Reader) error {
+	p.called = true
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 func TestPageScreenshotFullpage(t *testing.T) {
 	t.Parallel()
 
@@ -697,7 +703,7 @@ func TestPageScreenshotFullpage(t *testing.T) {
 
 		const div = document.createElement('div');
 		div.style.width = '1280px';
-		div.style.height = '800px';
+		div.style.height = '1600px';
 		div.style.background = 'linear-gradient(to bottom, red, blue)';
 
 		document.body.appendChild(div);
@@ -714,21 +720,37 @@ func TestPageScreenshotFullpage(t *testing.T) {
 	opts.FullPage = true
 	buf, err := p.Screenshot(opts, &mockPersister{})
 	require.NoError(t, err)
+	assert.Equal(t, map[string]float64{"width": 1280, "height": 800}, p.ViewportSize())
+	viewportRestored, err := p.Evaluate(`() => window.innerWidth === 1280 && window.innerHeight === 800`)
+	require.NoError(t, err)
+	assert.Equal(t, true, viewportRestored)
 
 	reader := bytes.NewReader(buf)
 	img, err := png.Decode(reader)
 	assert.Nil(t, err)
 
 	assert.Equal(t, 1280, img.Bounds().Max.X, "want: screenshot width is 1280px, got: %dpx", img.Bounds().Max.X)
-	assert.Equal(t, 800, img.Bounds().Max.Y, "want: screenshot height is 800px, got: %dpx", img.Bounds().Max.Y)
+	assert.Equal(t, 1600, img.Bounds().Max.Y, "want: screenshot height is 1600px, got: %dpx", img.Bounds().Max.Y)
 
 	// Allow tolerance to account for differences in rendering between
 	// different platforms and browsers. The goal is to ensure that the
 	// screenshot is mostly red at the top and mostly blue at the bottom.
 	r, _, b, _ := img.At(0, 0).RGBA()
 	assert.Truef(t, r > b*2, "want: the top pixel to be dominantly red, got R: %d, B: %d", r, b)
-	r, _, b, _ = img.At(0, 799).RGBA()
+	r, _, b, _ = img.At(0, 1599).RGBA()
 	assert.Truef(t, b > r*2, "want: the bottom pixel to be dominantly blue, got R: %d, B: %d", r, b)
+
+	// A deadline after capture must also restore the enlarged viewport.
+	p.SetDefaultTimeout(2000)
+	opts.Path = "unused.png"
+	persister := &timeoutScreenshotPersister{}
+	_, err = p.Screenshot(opts, persister)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.True(t, persister.called)
+	assert.Equal(t, map[string]float64{"width": 1280, "height": 800}, p.ViewportSize())
+	viewportRestored, err = p.Evaluate(`() => window.innerWidth === 1280 && window.innerHeight === 800`)
+	require.NoError(t, err)
+	assert.Equal(t, true, viewportRestored)
 }
 
 func TestPageTitle(t *testing.T) {
@@ -1477,33 +1499,45 @@ func TestPageWaitForSelector(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name          string
-		url           string
-		opts          map[string]any
-		customTimeout time.Duration
-		selector      string
-		errAssert     func(*testing.T, error)
+		name     string
+		selector string
+		state    common.DOMElementState
+		timeout  time.Duration
+		wantNil  bool
+		wantErr  string
 	}{
 		{
 			name:     "should wait for selector",
-			url:      "wait_for.html",
 			selector: "#my-div",
-			errAssert: func(t *testing.T, e error) {
-				t.Helper()
-				assert.Nil(t, e)
-			},
+			state:    common.DOMElementStateVisible,
+			timeout:  common.DefaultTimeout,
 		},
 		{
-			name: "should TO waiting for selector",
-			url:  "wait_for.html",
-			// set a timeout smaller than the time
-			// it takes the element to show up
-			customTimeout: time.Nanosecond,
-			selector:      "#my-div",
-			errAssert: func(t *testing.T, e error) {
-				t.Helper()
-				assert.ErrorContains(t, e, "timed out after")
-			},
+			name:     "should TO waiting for selector",
+			selector: "#my-div",
+			state:    common.DOMElementStateVisible,
+			timeout:  time.Nanosecond,
+			wantErr:  "timed out after",
+		},
+		{
+			name:     "absent hidden element",
+			selector: "#absent",
+			state:    common.DOMElementStateHidden,
+			timeout:  time.Second,
+			wantNil:  true,
+		},
+		{
+			name:     "absent detached element",
+			selector: "#absent",
+			state:    common.DOMElementStateDetached,
+			timeout:  time.Second,
+			wantNil:  true,
+		},
+		{
+			name:     "existing hidden element",
+			selector: "head",
+			state:    common.DOMElementStateHidden,
+			timeout:  time.Second,
 		},
 	}
 
@@ -1512,24 +1546,25 @@ func TestPageWaitForSelector(t *testing.T) {
 			t.Parallel()
 
 			tb := newTestBrowser(t, withFileServer())
-
 			page := tb.NewPage(nil)
-			opts := &common.FrameGotoOptions{
+			_, err := page.Goto(tb.staticURL("wait_for.html"), &common.FrameGotoOptions{
 				Timeout: common.DefaultTimeout,
-			}
-			_, err := page.Goto(
-				tb.staticURL(tc.url),
-				opts,
-			)
+			})
 			require.NoError(t, err)
 
-			timeout := page.MainFrame().Timeout()
-			if tc.customTimeout != 0 {
-				timeout = tc.customTimeout
+			opts := common.NewFrameWaitForSelectorOptions(tc.timeout)
+			opts.State = tc.state
+			element, err := page.WaitForSelector(tc.selector, opts)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
 			}
-
-			_, err = page.WaitForSelector(tc.selector, common.NewFrameWaitForSelectorOptions(timeout))
-			tc.errAssert(t, err)
+			require.NoError(t, err)
+			if tc.wantNil {
+				assert.Nil(t, element)
+			} else {
+				assert.NotNil(t, element)
+			}
 		})
 	}
 }
@@ -2343,7 +2378,8 @@ func TestPageOnRequest(t *testing.T) {
 		page.on('request', async (request) => {
 			returnValue.push({
 				allHeaders: await request.allHeaders(),
-				frameUrl: request.frame().url(),
+				// Ignoring frameUrl as it is racey due to the async nature of how it is set.
+				// frameUrl: request.frame().url(),
 				acceptLanguageHeader: await request.headerValue('Accept-Language'),
 				headers: request.headers(),
 				headersArray: await request.headersArray(),
@@ -2383,7 +2419,6 @@ func TestPageOnRequest(t *testing.T) {
 				"upgrade-insecure-requests": "1",
 				"user-agent":                "some-user-agent",
 			},
-			FrameURL:             "about:blank",
 			AcceptLanguageHeader: "en-US",
 			Headers: map[string]string{
 				"Accept-Language":           "en-US",
@@ -2412,7 +2447,6 @@ func TestPageOnRequest(t *testing.T) {
 				"referer":         tb.url("/home"),
 				"user-agent":      "some-user-agent",
 			},
-			FrameURL:             tb.url("/home"),
 			AcceptLanguageHeader: "en-US",
 			Headers: map[string]string{
 				"Accept-Language": "en-US",
@@ -2442,7 +2476,6 @@ func TestPageOnRequest(t *testing.T) {
 				"referer":         tb.url("/home"),
 				"user-agent":      "some-user-agent",
 			},
-			FrameURL:             tb.url("/home"),
 			AcceptLanguageHeader: "en-US",
 			Headers: map[string]string{
 				"Accept-Language": "en-US",
@@ -2473,7 +2506,6 @@ func TestPageOnRequest(t *testing.T) {
 				"referer":         tb.url("/home"),
 				"user-agent":      "some-user-agent",
 			},
-			FrameURL:             tb.url("/home"),
 			AcceptLanguageHeader: "en-US",
 			Headers: map[string]string{
 				"Accept-Language": "en-US",
@@ -2499,22 +2531,43 @@ func TestPageOnRequest(t *testing.T) {
 	}
 
 	// Compare each request one by one for better test failure visibility
+	// We only want to compare against the expected values. The actual values
+	// may contain extra headers that are not present in the expected values.
+	// Extra headers are racey and can be present or may not be present when
+	// the page.on('request') handler is called.
 	for _, req := range requests {
 		i := slices.IndexFunc(expected, func(r request) bool { return req.URL == r.URL })
 		assert.NotEqual(t, -1, i, "failed to find expected request with URL %s", req.URL)
 
-		sortByName := func(m1, m2 map[string]string) int {
-			return strings.Compare(m1["name"], m2["name"])
+		expectedHeadersArray := make(map[string]string)
+		for _, header := range expected[i].HeadersArray {
+			expectedHeadersArray[header["name"]] = header["value"]
 		}
-		slices.SortFunc(req.HeadersArray, sortByName)
-		slices.SortFunc(expected[i].HeadersArray, sortByName)
-		assert.Equal(t, expected[i], req)
+		for name, value := range expected[i].AllHeaders {
+			actualValue, ok := req.AllHeaders[name]
+			require.True(t, ok, "missing allHeaders[%s] for %s", name, req.URL)
+			require.Equal(t, value, actualValue, "allHeaders[%s] mismatch for %s", name, req.URL)
+		}
+		require.Equal(t, expected[i].AcceptLanguageHeader, req.AcceptLanguageHeader, i)
+		require.Equal(t, expected[i].Headers, req.Headers, i)
+		for _, header := range req.HeadersArray {
+			if expectedValue, ok := expectedHeadersArray[header["name"]]; ok {
+				require.Equal(t, expectedValue, header["value"], "headersArray[%s] mismatch for %s", header["name"], req.URL)
+				delete(expectedHeadersArray, header["name"])
+			}
+		}
+		require.Empty(t, expectedHeadersArray, "missing headersArray entries for %s", req.URL)
+		require.Equal(t, expected[i].IsNavigationRequest, req.IsNavigationRequest, i)
+		require.Equal(t, expected[i].Method, req.Method, i)
+		require.Equal(t, expected[i].PostData, req.PostData, i)
+		require.Equal(t, expected[i].PostDataBuffer, req.PostDataBuffer, i)
+		require.Equal(t, expected[i].ResourceType, req.ResourceType, i)
+		require.Equal(t, expected[i].URL, req.URL, i)
 	}
 }
 
 type request struct {
 	AllHeaders           map[string]string   `json:"allHeaders"`
-	FrameURL             string              `json:"frameUrl"`
 	AcceptLanguageHeader string              `json:"acceptLanguageHeader"`
 	Headers              map[string]string   `json:"headers"`
 	HeadersArray         []map[string]string `json:"headersArray"`
@@ -2813,16 +2866,224 @@ func TestPageOnResponse(t *testing.T) {
 	}
 
 	// Compare each response one by one for better test failure visibility
+	// We only want to compare against the expected values. The actual values
+	// may contain extra headers that are not present in the expected values.
+	// Extra headers are racey and can be present or may not be present when
+	// the page.on('response') handler is called.
 	for _, resp := range responses {
 		i := slices.IndexFunc(expected, func(r response) bool { return resp.URL == r.URL })
 		assert.NotEqual(t, -1, i, "failed to find expected request with URL %s", resp.URL)
 
-		sortByName := func(m1, m2 map[string]string) int {
-			return strings.Compare(m1["name"], m2["name"])
+		expectedHeadersArray := make(map[string]string)
+		for _, header := range expected[i].HeadersArray {
+			expectedHeadersArray[header["name"]] = header["value"]
 		}
-		slices.SortFunc(resp.HeadersArray, sortByName)
-		slices.SortFunc(expected[i].HeadersArray, sortByName)
-		assert.Equal(t, expected[i], resp)
+		for name, value := range expected[i].AllHeaders {
+			actualValue, ok := resp.AllHeaders[name]
+			require.True(t, ok, "missing allHeaders[%s] for %s", name, resp.URL)
+			require.Equal(t, value, actualValue, "allHeaders[%s] mismatch for %s", name, resp.URL)
+		}
+		require.Equal(t, expected[i].Body, resp.Body, i)
+		require.Equal(t, expected[i].FrameURL, resp.FrameURL, i)
+		require.Equal(t, expected[i].AcceptLanguageHeader, resp.AcceptLanguageHeader, i)
+		require.Equal(t, expected[i].AcceptLanguageHeaders, resp.AcceptLanguageHeaders, i)
+		require.Equal(t, expected[i].Headers, resp.Headers, i)
+		for _, header := range resp.HeadersArray {
+			if expectedValue, ok := expectedHeadersArray[header["name"]]; ok {
+				require.Equal(t, expectedValue, header["value"], "headersArray[%s] mismatch for %s", header["name"], resp.URL)
+				delete(expectedHeadersArray, header["name"])
+			}
+		}
+		require.Empty(t, expectedHeadersArray, "missing headersArray entries for %s", resp.URL)
+		require.Equal(t, expected[i].JSON, resp.JSON, i)
+		require.Equal(t, expected[i].OK, resp.OK, i)
+		require.Equal(t, expected[i].RequestURL, resp.RequestURL, i)
+		require.Equal(t, expected[i].SecurityDetails, resp.SecurityDetails, i)
+		require.Equal(t, expected[i].ServerAddr, resp.ServerAddr, i)
+		require.Equal(t, expected[i].Status, resp.Status, i)
+		require.Equal(t, expected[i].StatusText, resp.StatusText, i)
+		require.Equal(t, expected[i].URL, resp.URL, i)
+		require.Equal(t, expected[i].Text, resp.Text, i)
+	}
+}
+
+func TestPageOnRequestAllHeadersExtraInfo(t *testing.T) {
+	t.Parallel()
+
+	tb := newTestBrowser(t, withHTTPServer())
+	tb.withHandler("/set-cookie", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Set-Cookie", "test_cookie_name=test_cookie_value; Path=/")
+		_, err := fmt.Fprint(w, "ok")
+		require.NoError(t, err)
+	})
+
+	p := tb.NewPage(nil)
+
+	opts := &common.FrameGotoOptions{
+		WaitUntil: common.LifecycleEventNetworkIdle,
+		Timeout:   common.DefaultTimeout,
+	}
+	// This will tell the browser to store the cookie
+	_, err := p.Goto(tb.url("/set-cookie"), opts)
+	require.NoError(t, err)
+
+	// The cookie in the browser store is sent as a header in the request
+	gotoPage := func() error {
+		_, err := p.Goto(tb.url("/set-cookie"), opts)
+		return err
+	}
+
+	// We are only guaranteed to have the extra headers when the requestfinished
+	// event is fired. Trying to retrieve the extra headers on anyother event will
+	// be racey and may not be present.
+	var ev common.PageEvent
+	waitForRequestFinished := func() error {
+		var err error
+		ev, err = p.WaitForEvent(
+			common.PageEventRequestFinished,
+			&common.PageWaitForEventOptions{Timeout: p.Timeout()},
+			func(pe common.PageEvent) (bool, error) {
+				return strings.Contains(pe.Request.URL(), "/set-cookie"), nil
+			},
+		)
+		return err
+	}
+
+	err = tb.run(tb.context(), gotoPage, waitForRequestFinished)
+	require.NoError(t, err)
+	require.NotNil(t, ev.Request)
+
+	assert.Contains(t, ev.Request.AllHeaders()["cookie"], "test_cookie_name=test_cookie_value")
+}
+
+func TestPageOnResponseAllHeadersExtraInfo(t *testing.T) {
+	t.Parallel()
+
+	tb := newTestBrowser(t, withHTTPServer())
+	tb.withHandler("/set-cookie", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Set-Cookie", "test_cookie_name=test_cookie_value; Path=/")
+		_, err := fmt.Fprint(w, "ok")
+		require.NoError(t, err)
+	})
+
+	p := tb.NewPage(nil)
+
+	opts := &common.FrameGotoOptions{
+		WaitUntil: common.LifecycleEventNetworkIdle,
+		Timeout:   common.DefaultTimeout,
+	}
+	gotoPage := func() error {
+		_, err := p.Goto(tb.url("/set-cookie"), opts)
+		return err
+	}
+
+	// We are only guaranteed to have the extra headers when the requestfinished
+	// event is fired. Trying to retrieve the extra headers on anyother event will
+	// be racey and may not be present.
+	var ev common.PageEvent
+	waitForRequestFinished := func() error {
+		var err error
+		ev, err = p.WaitForEvent(
+			common.PageEventRequestFinished,
+			&common.PageWaitForEventOptions{Timeout: p.Timeout()},
+			func(pe common.PageEvent) (bool, error) {
+				return strings.Contains(pe.Request.URL(), "/set-cookie"), nil
+			},
+		)
+		return err
+	}
+
+	err := tb.run(tb.context(), gotoPage, waitForRequestFinished)
+	require.NoError(t, err)
+	require.NotNil(t, ev.Request)
+
+	assert.Contains(t, ev.Request.Response().AllHeaders()["set-cookie"], "test_cookie_name=test_cookie_value")
+}
+
+// TestPageOnResponseAllHeadersRedirectChain verifies that each response in a
+// redirect chain receives its own distinct extra headers from
+// responseReceivedExtraInfo, rather than merging them all together.
+func TestPageOnResponseAllHeadersRedirectChain(t *testing.T) {
+	t.Parallel()
+
+	tb := newTestBrowser(t, withHTTPServer())
+
+	// A 3-step redirect chain where each hop sets a distinct Set-Cookie.
+	// Set-Cookie is delivered only via responseReceivedExtraInfo (Chrome
+	// strips it from the provisional responseReceived headers), so a hop's
+	// cookie can appear in allHeaders() only if the ExtraInfo events were
+	// paired with the correct response. This catches both mis-attribution (a
+	// later hop's cookie landing on an earlier response) and merging.
+	tb.withHandler("/redir-start", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Set-Cookie", "step=1; Path=/")
+		http.Redirect(w, r, tb.url("/redir-mid"), http.StatusFound)
+	})
+	tb.withHandler("/redir-mid", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Set-Cookie", "step=2; Path=/")
+		http.Redirect(w, r, tb.url("/redir-end"), http.StatusFound)
+	})
+	tb.withHandler("/redir-end", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Set-Cookie", "step=3; Path=/")
+		w.Header().Set("Content-Type", "text/html")
+		_, err := fmt.Fprint(w, "<html><body>done</body></html>")
+		require.NoError(t, err)
+	})
+
+	tb.vu.ActivateVU()
+	tb.vu.StartIteration(t)
+	defer tb.vu.EndIteration(t)
+
+	gv, err := tb.vu.RunAsync(t, `
+		const page = await browser.newPage();
+
+		var responses = [];
+		page.on('response', async (response) => {
+			const headers = await response.allHeaders();
+			responses.push({
+				url: response.url(),
+				setCookie: headers['set-cookie'] || '',
+			});
+		});
+
+		await page.goto('%s', {waitUntil: 'networkidle'});
+		await page.close();
+
+		return JSON.stringify(responses);
+	`, tb.url("/redir-start"))
+	require.NoError(t, err)
+
+	got := k6test.ToPromise(t, gv)
+
+	var responses []struct {
+		URL       string `json:"url"`
+		SetCookie string `json:"setCookie"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(got.Result().String()), &responses))
+
+	setCookieByURL := make(map[string]string, len(responses))
+	for _, r := range responses {
+		setCookieByURL[r.URL] = r.SetCookie
+	}
+
+	// Each hop must carry only its own Set-Cookie.
+	steps := []string{"step=1", "step=2", "step=3"}
+	for _, tc := range []struct {
+		url  string
+		step string
+	}{
+		{tb.url("/redir-start"), "step=1"},
+		{tb.url("/redir-mid"), "step=2"},
+		{tb.url("/redir-end"), "step=3"},
+	} {
+		cookie, ok := setCookieByURL[tc.url]
+		require.True(t, ok, "no response captured for %s", tc.url)
+		assert.Contains(t, cookie, tc.step, "wrong Set-Cookie on %s", tc.url)
+		for _, other := range steps {
+			if other != tc.step {
+				assert.NotContains(t, cookie, other,
+					"%s leaked %s from another hop", tc.url, other)
+			}
+		}
 	}
 }
 
@@ -4024,6 +4285,35 @@ func TestClickInNestedFramesCORS(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, expectedCount, countD)
 	})
+}
+
+func TestPageRouteConcurrentEnableDataRace(t *testing.T) {
+	t.Parallel()
+
+	tb := newTestBrowser(t, withHTTPServer())
+	p := tb.NewPage(nil)
+
+	matcher := func(pattern, url string) (bool, error) {
+		return regexp.MatchString(fmt.Sprintf("http://[^/]*%s", pattern), url)
+	}
+	h := func(rt *common.Route) error { return rt.Continue(common.ContinueOptions{}) }
+
+	// This test is intended to surface a data race under `go test -race`: concurrent first-time registrations
+	// can each observe routes as empty and call updateRequestInterception(true).
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+	for i := range 16 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errCh <- p.Route(fmt.Sprintf("/api/%d", i), h, matcher)
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
 }
 
 func TestPageUnroute(t *testing.T) {

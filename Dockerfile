@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine@sha256:f23e8b227fb4493eabe03bede4d5a32d04092da71962f1fb79b5f7d1e6c2a17f as builder
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine@sha256:4cb7ac979db5fcc41cae44b2227ba5ab8a51e8807f40d9ba4dee20a0ad960b5b as builder
 WORKDIR $GOPATH/src/go.k6.io/k6
 COPY . .
 ARG TARGETOS TARGETARCH
@@ -6,7 +6,7 @@ RUN apk --no-cache add git=~2
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -o /usr/bin/k6
 
 # Runtime stage
-FROM alpine:3.24.0@sha256:a2d49ea686c2adfe3c992e47dc3b5e7fa6e6b5055609400dc2acaeb241c829f4 as release
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b as release
 
 RUN adduser -D -u 12345 -g 12345 k6
 COPY --from=builder /usr/bin/k6 /usr/bin/k6

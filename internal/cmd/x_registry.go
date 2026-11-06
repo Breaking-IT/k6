@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -69,6 +70,12 @@ func catalogMajorVersion() string {
 	return v
 }
 
+// catalogURL returns the extension registry catalog URL, honouring the
+// K6_PROVISION_CATALOG_URL override.
+func catalogURL(gs *state.GlobalState) string {
+	return cmp.Or(gs.Env[state.ProvisionCatalogURL], defaultCatalogURL())
+}
+
 // catalogCachePath returns the on-disk location of the k6 extension registry
 // catalog cache, alongside the build cache so both share the user cache dir.
 func catalogCachePath(gs *state.GlobalState) string {
@@ -79,23 +86,9 @@ func catalogCachePath(gs *state.GlobalState) string {
 // cache. A missing or stale cache returns (nil, nil); real I/O or parse
 // failures return an error so the caller can surface them at debug.
 func readCachedCatalog(gs *state.GlobalState, cachePath string) (registrySubcommands, error) {
-	maxAge := 24 * time.Hour
-	if d, err := time.ParseDuration(gs.Env[state.ProvisionCatalogTTL]); err == nil {
-		maxAge = d
-	}
-	info, err := gs.FS.Stat(cachePath)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("checking extensions cache: %w", err)
-	}
-	if time.Since(info.ModTime()) > maxAge {
-		return nil, nil
-	}
-	raw, err := fsext.ReadFile(gs.FS, cachePath)
-	if err != nil {
-		return nil, fmt.Errorf("reading extensions cache: %w", err)
+	raw, err := readCachedCatalogBytes(gs, cachePath)
+	if raw == nil || err != nil {
+		return nil, err
 	}
 	var subs registrySubcommands
 	if err := json.Unmarshal(raw, &subs); err != nil {
@@ -117,7 +110,7 @@ func fetchCatalog(ctx context.Context, url string) (registrySubcommands, []byte,
 	}
 	// The URL can be overridden via env for tests and development; that is the
 	// intended behaviour of the catalog override, not an SSRF vector.
-	resp, err := http.DefaultClient.Do(req) //nolint:gosec
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("fetching extensions catalog: %w", err)
 	}
@@ -134,6 +127,32 @@ func fetchCatalog(ctx context.Context, url string) (registrySubcommands, []byte,
 		return nil, nil, fmt.Errorf("parsing extensions catalog: %w", err)
 	}
 	return subs, raw, nil
+}
+
+// readCachedCatalogBytes returns the raw catalog cache bytes when the cache
+// exists and is fresh, honouring the K6_PROVISION_CATALOG_TTL override. A miss
+// (absent or stale cache) returns (nil, nil); real I/O failures return an
+// error so the caller can surface them at debug.
+func readCachedCatalogBytes(gs *state.GlobalState, cachePath string) ([]byte, error) {
+	maxAge := 24 * time.Hour
+	if d, err := time.ParseDuration(gs.Env[state.ProvisionCatalogTTL]); err == nil {
+		maxAge = d
+	}
+	info, err := gs.FS.Stat(cachePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("checking extensions cache: %w", err)
+	}
+	if time.Since(info.ModTime()) > maxAge {
+		return nil, nil
+	}
+	raw, err := fsext.ReadFile(gs.FS, cachePath)
+	if err != nil {
+		return nil, fmt.Errorf("reading extensions cache: %w", err)
+	}
+	return raw, nil
 }
 
 // writeCachedCatalog persists raw catalog bytes under cachePath, creating any

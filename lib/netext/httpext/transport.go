@@ -149,24 +149,9 @@ func (t *transport) measureAndEmitMetrics(unfReq *unfinishedRequest) *finishedRe
 
 	trail.SaveSamples(t.state.BuiltinMetrics, &tagsAndMeta)
 	if t.responseCallback != nil {
-		trail.Failed.Valid = true
-		if failed == 1 {
-			trail.Failed.Bool = true
-		}
-		failedSample := metrics.Sample{
-			TimeSeries: metrics.TimeSeries{
-				Metric: t.state.BuiltinMetrics.HTTPReqFailed,
-				Tags:   tagsAndMeta.Tags,
-			},
-			Time:     trail.EndTime,
-			Metadata: tagsAndMeta.Metadata,
-			Value:    failed,
-		}
-		if failed == 1 && t.state.Options.HTTPErrorData.Bool {
-			setHTTPErrorFields(&failedSample, t.errorDataReq, t.errorDataResp)
-		}
-		trail.Samples = append(trail.Samples, failedSample)
+		t.addFailedSample(trail, &tagsAndMeta, failed)
 	}
+
 	metrics.PushIfNotDone(t.ctx, t.state.Samples, trail)
 	return result
 }
@@ -254,25 +239,14 @@ func setHTTPErrorFields(s *metrics.Sample, req *Request, resp *Response) {
 	if resp != nil {
 		s.HTTPErrorResHeaders = formatResponseHeaders(resp.Proto, resp.StatusText, resp.Headers)
 	}
-	if resp != nil && resp.Body != nil {
-		switch body := resp.Body.(type) {
-		case string:
-			if body != "" {
-				if utf8.ValidString(body) {
-					s.HTTPErrorResBody = body
-				} else {
-					s.HTTPErrorResBody = "<binary>"
-				}
-			}
-		case []byte:
-			if len(body) > 0 {
-				if utf8.Valid(body) {
-					s.HTTPErrorResBody = string(body)
-				} else {
-					s.HTTPErrorResBody = "<binary>"
-				}
-			}
-		}
+	if resp == nil {
+		return
+	}
+	switch body := resp.Body.(type) {
+	case string:
+		s.HTTPErrorResBody = printableErrorBody(body)
+	case []byte:
+		s.HTTPErrorResBody = printableErrorBody(string(body))
 	}
 }
 
@@ -323,4 +297,31 @@ func formatResponseHeaders(proto string, statusText string, headers map[string]s
 		b.WriteString(v)
 	}
 	return b.String()
+}
+
+func printableErrorBody(body string) string {
+	if !utf8.ValidString(body) {
+		return "<binary>"
+	}
+	return body
+}
+
+func (t *transport) addFailedSample(trail *Trail, tagsAndMeta *metrics.TagsAndMeta, failed float64) {
+	trail.Failed.Valid = true
+	if failed == 1 {
+		trail.Failed.Bool = true
+	}
+	failedSample := metrics.Sample{
+		TimeSeries: metrics.TimeSeries{
+			Metric: t.state.BuiltinMetrics.HTTPReqFailed,
+			Tags:   tagsAndMeta.Tags,
+		},
+		Time:     trail.EndTime,
+		Metadata: tagsAndMeta.Metadata,
+		Value:    failed,
+	}
+	if failed == 1 && t.state.Options.HTTPErrorData.Bool {
+		setHTTPErrorFields(&failedSample, t.errorDataReq, t.errorDataResp)
+	}
+	trail.Samples = append(trail.Samples, failedSample)
 }

@@ -2,26 +2,12 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "github>grafana/grafana-renovate-config//presets/k6/k6-engine-base.json",
-    "schedule:weekly"
+    "schedule:weekly",
+    "github>grafana/grafana-renovate-config//presets/k6/k6-engine-automerge.json"
   ],
   "ignorePaths": [
     "**/vendor/**",
     ".github/workflows/xk6-tests/**"
-  ],
-  "customManagers": [
-    {
-      "customType": "regex",
-      "description": "Track Go minor version in setup-go go-version: 1.X.x lines",
-      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
-      "matchStrings": [
-        "go-version:\\s+(?<currentValue>\\d+\\.\\d+)\\.x",
-        "go-version:\\s+\\[(?<currentValue>\\d+\\.\\d+)\\.x\\]"
-      ],
-      "depNameTemplate": "golang/go",
-      "datasourceTemplate": "golang-version",
-      "extractVersionTemplate": "^(?<version>\\d+\\.\\d+)",
-      "versioningTemplate": "loose"
-    }
   ],
   "baseBranchPatterns": [
     "master",

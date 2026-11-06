@@ -22,6 +22,7 @@ const (
 )
 
 func TestCloudLoginWithArgs(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	testCases := []struct {

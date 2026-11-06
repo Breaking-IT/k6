@@ -7,20 +7,42 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
+	"time"
 
+	"go.k6.io/k6/v2/cmd/state"
 	"go.k6.io/k6/v2/internal/build"
 	"go.k6.io/k6/v2/internal/execution"
 	"go.k6.io/k6/v2/internal/usage"
 )
 
+// envLookup adapts an environment map to the lookup-function shape the report
+// helpers share with the run path's LookupEnv.
+func envLookup(env map[string]string) func(string) (string, bool) {
+	return func(key string) (string, bool) {
+		val, ok := env[key]
+		return val, ok
+	}
+}
+
+// addEnvironmentInfo stamps the fields identifying this k6 binary and where it runs.
+func addEnvironmentInfo(m map[string]any, lookupEnv func(string) (string, bool)) {
+	m["k6_version"] = build.Version
+	m["goos"] = runtime.GOOS
+	m["goarch"] = runtime.GOARCH
+	m["is_ci"] = isCI(lookupEnv)
+}
+
+// createReport assembles the anonymous usage report for a run from its scheduler
+// and recorded usage. Extension identities are intentionally not collected.
 func createReport(u *usage.Usage, execScheduler *execution.Scheduler) map[string]any {
 	execState := execScheduler.GetState()
 	m := u.Map()
+	// The fork deliberately excludes detailed extension-usage reporting.
+	delete(m, "extensions")
 
-	m["k6_version"] = build.Version
+	addEnvironmentInfo(m, execState.Test.LookupEnv)
+
 	m["duration"] = execState.GetCurrentTestRunDuration().String()
-	m["goos"] = runtime.GOOS
-	m["goarch"] = runtime.GOARCH
 	m["vus_max"] = uint64(execState.GetInitializedVUsCount()) //nolint:gosec
 	m["iterations"] = execState.GetFullIterationCount()
 	executors := make(map[string]int)
@@ -28,26 +50,45 @@ func createReport(u *usage.Usage, execScheduler *execution.Scheduler) map[string
 		executors[ec.GetType()]++
 	}
 	m["executors"] = executors
-	m["is_ci"] = isCI(execState.Test.LookupEnv)
 
 	return m
 }
 
-func reportUsage(ctx context.Context, execScheduler *execution.Scheduler, test *loadedAndConfiguredTest) error {
-	m := createReport(test.preInitState.Usage, execScheduler)
+// reportUsage sends the report built by create, logging the attempt and outcome
+// at debug, all bounded by a timeout.
+func reportUsage(ctx context.Context, gs *state.GlobalState, create func(ctx context.Context) map[string]any) {
+	reportCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	gs.Logger.Debug("Sending usage report...")
+	if err := postUsageReport(reportCtx, envLookup(gs.Env), create(reportCtx)); err != nil {
+		gs.Logger.WithError(err).Debug("Error sending usage report")
+	} else {
+		gs.Logger.Debug("Usage report sent successfully")
+	}
+}
+
+// defaultUsageReportURL is the production endpoint the anonymous usage report
+// is sent to when K6_USAGE_REPORT_URL is not set.
+const defaultUsageReportURL = "https://stats.grafana.org/k6-usage-report"
+
+func postUsageReport(ctx context.Context, lookupEnv func(string) (string, bool), m map[string]any) error {
 	body, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
 
-	const usageStatsURL = "https://stats.grafana.org/k6-usage-report"
+	usageStatsURL := defaultUsageReportURL
+	if url, ok := lookupEnv(state.UsageReportURL); ok && url != "" {
+		usageStatsURL = url
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, usageStatsURL, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	res, err := http.DefaultClient.Do(req) //nolint:gosec
+	res, err := http.DefaultClient.Do(req)
 	if err == nil {
 		_ = res.Body.Close()
 	}

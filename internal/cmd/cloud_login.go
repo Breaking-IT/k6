@@ -273,7 +273,6 @@ func authenticateUserToken(
 			"Authentication failed as provided token or stack might not be valid."+
 				" Learn more: https://grafana.com/docs/grafana-cloud/testing/k6/author-run/tokens-and-cli-authentication."+
 				" Server error for details: %w",
-
 			err)
 	}
 	config.StackURL = null.StringFrom(stackURL)
@@ -310,7 +309,7 @@ func validateTokenV6(
 		return "", 0, 0, err
 	}
 
-	return normalizedURL, int64(authResp.StackId), int64(authResp.DefaultProjectId), nil
+	return normalizedURL, authResp.StackId, authResp.DefaultProjectId, nil
 }
 
 // normalizeStackURL converts a stack slug to a full URL if needed and removes trailing slashes.

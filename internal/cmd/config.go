@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"go.k6.io/k6/v2/cmd/state"
 	"go.k6.io/k6/v2/errext"
 	"go.k6.io/k6/v2/errext/exitcodes"
+	"go.k6.io/k6/v2/internal/features"
 	"go.k6.io/k6/v2/lib"
 	"go.k6.io/k6/v2/lib/executor"
 	"go.k6.io/k6/v2/lib/fsext"
@@ -33,7 +35,7 @@ func configFlagSet() *pflag.FlagSet {
 	flags.Bool(
 		"no-usage-report",
 		false,
-		"don't send anonymous usage"+"stats (https://grafana.com/docs/k6/latest/set-up/usage-collection/)",
+		"don't send anonymous usage stats (https://grafana.com/docs/k6/latest/set-up/usage-collection/)",
 	)
 	flags.StringArray("features", nil, "enable feature flags (comma-separated)")
 	return flags
@@ -48,6 +50,9 @@ type Config struct {
 
 	NoUsageReport null.Bool `json:"noUsageReport" envconfig:"K6_NO_USAGE_REPORT"`
 	WebDashboard  null.Bool `json:"webDashboard" envconfig:"K6_WEB_DASHBOARD"`
+
+	// once carries --once between the layers. Unexported keeps json and envconfig out.
+	once bool
 
 	// NoArchiveUpload is an option that is only used when running in local-execution mode with the cloud run
 	// command.
@@ -202,6 +207,22 @@ func readEnvConfig(envMap map[string]string) (Config, error) {
 	return conf, err
 }
 
+// readConfigLayers reads file and environment options before merging them.
+func readConfigLayers(gs *state.GlobalState) (Config, Config, error) {
+	fileConf, err := readDiskConfig(gs)
+	if err != nil {
+		err = fmt.Errorf("failed to load the configuration file from the local file system: %w", err)
+		return Config{}, Config{}, errext.WithExitCodeIfNone(err, exitcodes.InvalidConfig)
+	}
+
+	envConf, err := readEnvConfig(gs.Env)
+	if err != nil {
+		return Config{}, Config{}, errext.WithExitCodeIfNone(err, exitcodes.InvalidConfig)
+	}
+
+	return fileConf, envConf, nil
+}
+
 // getConsolidatedConfig assemble the final consolidated configuration from all of the different sources:
 // - start with the CLI-provided options to get shadowed (non-Valid) defaults in there
 // - add the global file config options
@@ -211,18 +232,9 @@ func readEnvConfig(envMap map[string]string) (Config, error) {
 // - set some defaults if they weren't previously specified
 // TODO: add better validation, more explicit default values and improve consistency between formats
 // TODO: accumulate all errors and differentiate between the layers?
-func getConsolidatedConfig(gs *state.GlobalState, cliConf Config, runnerOpts lib.Options) (Config, error) {
-	fileConf, err := readDiskConfig(gs)
-	if err != nil {
-		err = fmt.Errorf("failed to load the configuration file from the local file system: %w", err)
-		return Config{}, errext.WithExitCodeIfNone(err, exitcodes.InvalidConfig)
-	}
-
-	envConf, err := readEnvConfig(gs.Env)
-	if err != nil {
-		return Config{}, errext.WithExitCodeIfNone(err, exitcodes.InvalidConfig)
-	}
-
+func getConsolidatedConfig(
+	gs *state.GlobalState, cliConf, fileConf, envConf Config, runnerOpts lib.Options, flags *features.Flags,
+) (Config, error) {
 	conf := cliConf.Apply(fileConf)
 
 	warnOnShortHandOverride(conf.Options, runnerOpts, "script", gs.Logger)
@@ -234,6 +246,15 @@ func getConsolidatedConfig(gs *state.GlobalState, cliConf Config, runnerOpts lib
 	warnOnShortHandOverride(conf.Options, cliConf.Options, "cli", gs.Logger)
 	conf = conf.Apply(cliConf)
 
+	if flags != nil && flags.MergeRunTags {
+		conf.RunTags = mergeRunTags(
+			fileConf.RunTags,
+			runnerOpts.RunTags,
+			envConf.RunTags,
+			cliConf.RunTags,
+		)
+	}
+
 	conf = applyDefault(conf)
 
 	// TODO(imiric): Move this validation where it makes sense in the configuration
@@ -241,11 +262,25 @@ func getConsolidatedConfig(gs *state.GlobalState, cliConf Config, runnerOpts lib
 	// for CLI flags in cmd.getOptions, in case other configuration sources
 	// (e.g. env vars) overrode our default value. This is not done in
 	// lib.Options.Validate to avoid circular imports.
-	if _, err = metrics.GetResolversForTrendColumns(conf.SummaryTrendStats); err != nil {
+	if _, err := metrics.GetResolversForTrendColumns(conf.SummaryTrendStats); err != nil {
 		return Config{}, err
 	}
 
 	return conf, nil
+}
+
+// mergeRunTags accumulates RunTags from each layer in precedence order (lowest first).
+// On key collision, later (higher-priority) layers overwrite earlier ones.
+// Returns nil when every layer is empty to preserve the codebase's "tags":null serialization.
+func mergeRunTags(layers ...map[string]string) map[string]string {
+	merged := map[string]string{}
+	for _, l := range layers {
+		maps.Copy(merged, l)
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
 }
 
 func warnOnShortHandOverride(a, b lib.Options, bName string, logger logrus.FieldLogger) {
@@ -283,6 +318,9 @@ func applyDefault(conf Config) Config {
 	}
 	if !conf.TeardownTimeout.Valid {
 		conf.TeardownTimeout.Duration = types.Duration(60 * time.Second)
+	}
+	if !conf.HandleSummaryTimeout.Valid {
+		conf.HandleSummaryTimeout.Duration = types.Duration(120 * time.Second)
 	}
 	return conf
 }

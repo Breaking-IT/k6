@@ -37,6 +37,11 @@ type Sample struct {
 	HTTPErrorReqBody    string
 	HTTPErrorResHeaders string
 	HTTPErrorResBody    string
+
+	// GroupFailed is set on group_duration when the callback throws or its returned promise
+	// rejects. The breakingit output uses it for transaction outcomes without adding metric tags.
+	// Failed checks and errors caught inside the callback do not make a group fail.
+	GroupFailed bool
 }
 
 // SampleContainer is a simple abstraction that allows sample

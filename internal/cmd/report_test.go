@@ -50,8 +50,9 @@ func TestCreateReport(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		s.GetState().MarkEnded()
 
-		m := createReport(usage.New(), s)
-		require.NoError(t, err)
+		u := usage.New()
+		require.NoError(t, u.Values("extensions", map[string]string{"module": "example.invalid/private"}))
+		m := createReport(u, s)
 
 		assert.Equal(t, build.Version, m["k6_version"])
 		assert.EqualValues(t, map[string]int{"shared-iterations": 1}, m["executors"])
@@ -59,6 +60,7 @@ func TestCreateReport(t *testing.T) {
 		assert.EqualValues(t, 170, m["iterations"])
 		assert.NotEqual(t, "0s", m["duration"])
 		assert.EqualValues(t, false, m["is_ci"])
+		assert.NotContains(t, m, "extensions")
 	})
 
 	t.Run("CI=false", func(t *testing.T) {
@@ -73,7 +75,6 @@ func TestCreateReport(t *testing.T) {
 		require.NoError(t, err)
 
 		m := createReport(usage.New(), s)
-		require.NoError(t, err)
 
 		assert.Equal(t, build.Version, m["k6_version"])
 		assert.EqualValues(t, map[string]int{"shared-iterations": 1}, m["executors"])
@@ -95,7 +96,6 @@ func TestCreateReport(t *testing.T) {
 		require.NoError(t, err)
 
 		m := createReport(usage.New(), s)
-		require.NoError(t, err)
 
 		assert.Equal(t, build.Version, m["k6_version"])
 		assert.EqualValues(t, map[string]int{"shared-iterations": 1}, m["executors"])
