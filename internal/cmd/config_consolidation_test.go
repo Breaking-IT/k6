@@ -567,6 +567,9 @@ func getConfigConsolidationTestCases() []configConsolidationTestCase {
 }
 
 func runTestCase(t *testing.T, testCase configConsolidationTestCase, subCmd string) {
+	if leanBuild && strings.HasPrefix(subCmd, "cloud") {
+		t.Skip("cloud configuration is excluded from lean builds")
+	}
 	t.Logf("Test for `k6 %s` with opts=%#v and exp=%#v\n", subCmd, testCase.options, testCase.expected)
 
 	ts := tests.NewGlobalTestState(t)

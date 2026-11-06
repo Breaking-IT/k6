@@ -14,6 +14,7 @@ import (
 )
 
 func TestCloudLoadZoneList(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	t.Run("lists load zones successfully", func(t *testing.T) {

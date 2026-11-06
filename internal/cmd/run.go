@@ -232,10 +232,8 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 		}
 
 		summaryMeta := summary.Meta{
-			Script: string(test.source.Data),
-			IsCloud: slices.ContainsFunc(outputs, func(o output.Output) bool {
-				return isCloudOutput(o)
-			}),
+			Script:  string(test.source.Data),
+			IsCloud: slices.ContainsFunc(outputs, isCloudOutput),
 		}
 
 		// Instantiates the summary output

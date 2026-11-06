@@ -167,6 +167,9 @@ func TestBinaryNameHelpStdout(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		if leanBuild && tt.cmdName == "cloud" {
+			continue
+		}
 		ts.CmdArgs = []string{ts.BinaryName, "help", tt.cmdName, tt.extraCmd}
 		cmd.ExecuteWithGlobalState(ts.GlobalState)
 		stdout := ts.Stdout.String()
@@ -577,6 +580,7 @@ func getCloudTestEndChecker(
 	tb testing.TB, testRunID int,
 	testStart http.Handler, expRunStatus cloudapi.RunStatus, expResultStatus cloudapi.ResultStatus,
 ) *httptest.Server {
+	requireFullBuild(tb)
 	testFinished := false
 
 	if testStart == nil {
@@ -1188,6 +1192,7 @@ func runTestWithLinger(t *testing.T, ts *GlobalTestState) {
 }
 
 func TestExecutionResultWithLinger(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	addr := getFreeBindAddr(t)
@@ -2031,6 +2036,7 @@ export default function() {};`
 }
 
 func TestPrometheusRemoteWriteOutput(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	ts := NewGlobalTestState(t)
@@ -2121,6 +2127,7 @@ func TestUIRenderOutput(t *testing.T) {
 }
 
 func TestUIRenderWebDashboard(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	tests := []struct {

@@ -441,7 +441,7 @@ func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request, compl
 			reqHeaders, reqBody := req.formatErrorRequestData()
 			sample.HTTPErrorReqHeaders = reqHeaders
 			sample.HTTPErrorReqBody = reqBody
-			// Fetch response body so error reporting includes it (formatErrorResponseData only uses already-loaded body otherwise).
+			// Fetch the response body for error reporting; formatting only uses an already-loaded body.
 			_ = resp.fetchBody()
 			resHeaders, resBody := resp.formatErrorResponseData()
 			sample.HTTPErrorResHeaders = resHeaders
@@ -600,68 +600,25 @@ func (m *NetworkManager) emitRequestFailedMetrics(req *Request, completion brows
 	durationMs := k6metrics.D(wallTime.Sub(req.wallTime))
 	reqHeaders, reqBody := req.formatErrorRequestData()
 
-	transferred = k6metrics.PushTrackedRequest(m.vu.Context(), state.Samples, completion.ticket, k6metrics.ConnectedSamples{
-		Samples: []k6metrics.Sample{
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqDuration, Tags: tags},
-				Value:      durationMs,
-				Time:       completion.at,
-				Metadata:   tagsAndMeta.Metadata,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqBlocked, Tags: tags},
-				Value:      0,
-				Time:       completion.at,
-				Metadata:   tagsAndMeta.Metadata,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqConnecting, Tags: tags},
-				Value:      0,
-				Time:       completion.at,
-				Metadata:   tagsAndMeta.Metadata,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqTLSHandshaking, Tags: tags},
-				Value:      0,
-				Time:       completion.at,
-				Metadata:   tagsAndMeta.Metadata,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqSending, Tags: tags},
-				Value:      0,
-				Time:       completion.at,
-				Metadata:   tagsAndMeta.Metadata,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqWaiting, Tags: tags},
-				Value:      0,
-				Time:       completion.at,
-				Metadata:   tagsAndMeta.Metadata,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqReceiving, Tags: tags},
-				Value:      0,
-				Time:       completion.at,
-				Metadata:   tagsAndMeta.Metadata,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserDataReceived, Tags: tags},
-				Value:      0,
-				Time:       completion.at,
-				Metadata:   tagsAndMeta.Metadata,
-			},
-			{
-				TimeSeries:          k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqFailed, Tags: tags},
-				Value:               1,
-				Time:                completion.at,
-				Metadata:            tagsAndMeta.Metadata,
-				HTTPErrorReqHeaders: reqHeaders,
-				HTTPErrorReqBody:    reqBody,
-				HTTPErrorResHeaders: "",
-				HTTPErrorResBody:    "",
-			},
-		},
-	})
+	samples := make([]k6metrics.Sample, 0, 9)
+	for _, metric := range []*k6metrics.Metric{
+		m.customMetrics.BrowserHTTPReqDuration, m.customMetrics.BrowserHTTPReqBlocked,
+		m.customMetrics.BrowserHTTPReqConnecting, m.customMetrics.BrowserHTTPReqTLSHandshaking,
+		m.customMetrics.BrowserHTTPReqSending, m.customMetrics.BrowserHTTPReqWaiting,
+		m.customMetrics.BrowserHTTPReqReceiving, m.customMetrics.BrowserDataReceived,
+		m.customMetrics.BrowserHTTPReqFailed,
+	} {
+		samples = append(samples, k6metrics.Sample{
+			TimeSeries: k6metrics.TimeSeries{Metric: metric, Tags: tags},
+			Time:       completion.at, Metadata: tagsAndMeta.Metadata,
+		})
+	}
+	samples[0].Value = durationMs
+	failed := &samples[len(samples)-1]
+	failed.Value = 1
+	failed.HTTPErrorReqHeaders = reqHeaders
+	failed.HTTPErrorReqBody = reqBody
+	transferred = k6metrics.PushTrackedRequest(m.vu.Context(), state.Samples, completion.ticket, k6metrics.ConnectedSamples{Samples: samples})
 }
 
 // handleURLTag will check if the url tag needs to be grouped by testing

@@ -14,6 +14,7 @@ import (
 )
 
 func TestCloudProjectList(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	t.Run("lists projects successfully", func(t *testing.T) {

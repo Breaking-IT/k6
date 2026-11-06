@@ -88,6 +88,7 @@ func mustExtractSingleSharedIterScenario(t *testing.T, opts lib.Options) executo
 }
 
 func TestCloudRunOnceLocalExecution(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	ts := makeTestState(t, onceCloudScript,
@@ -102,6 +103,7 @@ func TestCloudRunOnceLocalExecution(t *testing.T) {
 }
 
 func TestCloudRunOnceUploadsRewrittenArchive(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	_, tarData := uploadAndCaptureArchive(t,

@@ -18,6 +18,7 @@ import (
 )
 
 func TestK6CloudUpload(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	t.Run("TestCloudUploadUserNotAuthenticated", func(t *testing.T) {

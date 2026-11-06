@@ -19,7 +19,6 @@ import (
 // The second request is the follow-up tail of an already running flush.
 // Stop must wait for it and for the third row appended while it is in flight.
 func TestTimescaleStopJoinsFollowupFlush(t *testing.T) {
-	t.Setenv("PG_PROXY_TOKEN", "test-token")
 	first, second := make(chan struct{}), make(chan struct{})
 	releaseFirst, releaseSecond := make(chan struct{}), make(chan struct{})
 	var onceFirst, onceSecond sync.Once
@@ -68,7 +67,7 @@ func TestTimescaleStopJoinsFollowupFlush(t *testing.T) {
 	defer server.Close()
 	defer onceFirst.Do(func() { close(releaseFirst) })
 	defer onceSecond.Do(func() { close(releaseSecond) })
-	out, err := New(output.Params{ConfigArgument: server.URL, StdOut: io.Discard})
+	out, err := New(output.Params{ConfigArgument: server.URL, StdOut: io.Discard, Environment: map[string]string{"PG_PROXY_TOKEN": "test-token"}})
 	require.NoError(t, err)
 	l := out.(*Logger)
 	appendRow := func(row string) { l.mu.Lock(); l.bufHTTP.WriteString(row + "\n"); l.mu.Unlock() }
@@ -107,7 +106,6 @@ func TestTimescaleStopJoinsFollowupFlush(t *testing.T) {
 }
 
 func TestTimescaleStopDrainsUnexpiredMetricGroup(t *testing.T) {
-	t.Setenv("PG_PROXY_TOKEN", "test-token")
 	var mu sync.Mutex
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -118,16 +116,16 @@ func TestTimescaleStopDrainsUnexpiredMetricGroup(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer server.Close()
-	out, err := New(output.Params{ConfigArgument: server.URL, StdOut: io.Discard})
+	out, err := New(output.Params{ConfigArgument: server.URL, StdOut: io.Discard, Environment: map[string]string{"PG_PROXY_TOKEN": "test-token"}})
 	require.NoError(t, err)
 	l := out.(*Logger)
 	l.mu.Lock()
 	now := time.Now()
-	l.pendingHttpGroups[now.UnixNano()] = &MetricGroup{Timestamp: now.UnixNano(), LastUpdate: now, Tags: map[string]string{"name": "tail-request"}, Values: map[string]float64{"http_req_duration": 12}}
+	l.pendingHTTPGroups[now.UnixNano()] = &MetricGroup{Timestamp: now.UnixNano(), LastUpdate: now, Tags: map[string]string{"name": "tail-request"}, Values: map[string]float64{"http_req_duration": 12}}
 	l.mu.Unlock()
 	require.NoError(t, l.Stop())
 	mu.Lock()
 	defer mu.Unlock()
 	require.Equal(t, 1, requests)
-	require.Empty(t, l.pendingHttpGroups)
+	require.Empty(t, l.pendingHTTPGroups)
 }

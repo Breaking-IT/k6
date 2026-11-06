@@ -27,6 +27,7 @@ import (
 )
 
 func TestK6CloudRun(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 	runCloudTests(t, setupK6CloudRunCmd)
 }
@@ -53,6 +54,7 @@ func setupK6CloudRunCmd(cliFlags []string) []string {
 //	    "projectID": 124
 //	}
 func TestCloudRunWithArchive(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	ts := NewGlobalTestState(t)
@@ -120,6 +122,7 @@ func TestCloudRunWithArchive(t *testing.T) {
 }
 
 func TestCloudRunCommandIncompatibleFlags(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	testCases := []struct {
@@ -179,6 +182,7 @@ func TestCloudRunCommandIncompatibleFlags(t *testing.T) {
 }
 
 func TestCloudRunLocalExecution(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	t.Run("should upload the test archive via presigned S3 URL as a default", func(t *testing.T) {
@@ -488,6 +492,7 @@ export default function() {
 }
 
 func TestCloudRunLocalExecutionNoCloudSecrets(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	script := `
@@ -553,6 +558,7 @@ export default function() {};`
 }
 
 func TestCloudRunLocalExecutionCloudLogPusher(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	// The VU logs one line so the pusher has a deterministic entry to push;

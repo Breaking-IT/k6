@@ -1,11 +1,11 @@
-## Fork Policy (jgaalen/k6)
+## Fork Policy (Breaking-IT/k6)
 
-This repository is a personal fork of grafana/k6 with private modifications
+This repository is the public Breaking-IT fork of grafana/k6 with BreakTest modifications
 (lean cloud-free builds via the `lean` build tag, the breakingit output, etc.).
 
 - **Never push to upstream (grafana/k6).** Upstream is fetch-only: pull releases
   from it and merge them into this fork's branches, then push only to `origin`
-  (github.com/jgaalen/k6).
+  (github.com/Breaking-IT/k6).
 - After cloning this fork, disable pushes to upstream once:
   ```bash
   git remote add upstream https://github.com/grafana/k6.git
@@ -13,10 +13,12 @@ This repository is a personal fork of grafana/k6 with private modifications
   ```
   If a push to upstream fails with `DISABLED`, that is intentional — do not
   "fix" the URL.
-- To pull in a new upstream release: fetch upstream tags, fast-forward `master`
-  to the release tag, merge `master` into `breakingit`, and gate any new cloud
-  functionality behind `//go:build !lean` (see `internal/cmd/cloud_lean.go` for
-  the stub pattern). Release binaries are built with `-tags lean`
+- `master` is the canonical fork development and build branch. The historical
+  `breakingit` work is consolidated there; do not use upstream as a replacement for it.
+- To pull in a new stable upstream release: fetch upstream tags, create an integration
+  branch from `origin/master`, merge the release tag, and open a tested pull request
+  against Breaking-IT/k6 `master`. Gate any new cloud functionality behind `//go:build !lean`
+  (see `internal/cmd/cloud_lean.go` for the stub pattern). Release binaries are built with `-tags lean`
   (`./build-linux-binaries.sh`).
 
 ## Project Overview

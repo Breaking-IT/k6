@@ -188,6 +188,7 @@ func setupSelfProvisionedRun(
 // (httptest, no network) and asserts which bearer token k6 pushes with,
 // using distinct sentinel tokens so the source is unambiguous.
 func TestCloudMetricsPushCredentials(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	// Self-provisioned: creds come from the provisioning response and must

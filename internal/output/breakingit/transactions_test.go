@@ -25,7 +25,7 @@ func newTransactionTestLogger(synthetic bool) *Logger {
 		out: io.Discard, isSynthetic: synthetic,
 		bufHTTP: &bytes.Buffer{}, bufVUs: &bytes.Buffer{},
 		bufTrans: &bytes.Buffer{}, bufErrors: &bytes.Buffer{},
-		pendingHttpGroups: make(map[int64]*MetricGroup),
+		pendingHTTPGroups: make(map[int64]*MetricGroup),
 		envTags: map[string]string{
 			"run_id": "run-123", "location": "Amsterdam", "node_name": "node-1",
 			"scenario_name": "checkout",
@@ -130,11 +130,11 @@ func TestTransactionSource(t *testing.T) {
 }
 
 func TestTransactionSourceConfiguration(t *testing.T) {
-	t.Setenv("PG_PROXY_TOKEN", "test-token")
+	t.Parallel()
 	for _, value := range []string{"", "both", "groups", "pages", "invalid"} {
 		exporter, err := New(output.Params{
 			ConfigArgument: "http://127.0.0.1", StdOut: io.Discard,
-			Environment: map[string]string{"BREAKINGIT_TRANSACTION_SOURCE": value},
+			Environment: map[string]string{"BREAKINGIT_TRANSACTION_SOURCE": value, "PG_PROXY_TOKEN": "test-token"},
 		})
 		if value == "invalid" {
 			require.ErrorContains(t, err, "BREAKINGIT_TRANSACTION_SOURCE")
@@ -160,7 +160,7 @@ func TestBrowserRequestKeepsExplicitGroup(t *testing.T) {
 			{"/", "/", ""},
 		} {
 			l := newTransactionTestLogger(synthetic)
-			l.processHttpGroup(&MetricGroup{
+			l.processHTTPGroup(&MetricGroup{
 				Tags: map[string]string{"group": test.group, "path": test.path, "resource_type": "Document"},
 			})
 			rows, err := csv.NewReader(l.bufHTTP).ReadAll()

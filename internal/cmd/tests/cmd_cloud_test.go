@@ -17,6 +17,7 @@ import (
 )
 
 func TestCloudNoArgsShowsHelp(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	ts := NewGlobalTestState(t)

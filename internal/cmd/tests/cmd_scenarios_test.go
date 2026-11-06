@@ -44,6 +44,7 @@ func TestScenariosFilterArchive(t *testing.T) {
 			return buildArchive(t, scenariosScript, "--scenario", "ui,api")
 		},
 		"cloud run": func(t *testing.T) []byte {
+			requireFullBuild(t)
 			_, data := uploadAndCaptureArchive(t,
 				[]string{"k6", "cloud", "run", "--scenario", "ui,api", "test.js"}, nil, scenariosScript)
 			return data

@@ -121,7 +121,7 @@ func NewBreakTestDB(params output.Params) (output.Output, error) {
 	c.groupTickets = map[dbGroupKey]*metrics.RequestTicket{}
 	c.mapper = &Logger{out: params.StdOut, envTags: tags, customPatterns: patterns, transactionSource: source,
 		bufHTTP: &bytes.Buffer{}, bufVUs: &bytes.Buffer{}, bufTrans: &bytes.Buffer{}, bufErrors: &bytes.Buffer{},
-		pendingHttpGroups: map[int64]*MetricGroup{}, rowSink: c.addRow}
+		pendingHTTPGroups: map[int64]*MetricGroup{}, rowSink: c.addRow}
 	return c, nil
 }
 
@@ -306,7 +306,7 @@ func (c *BreakTestDBOutput) completeGroups(final bool) {
 		}
 		if complete {
 			delete(c.groups, key)
-			c.mapper.processHttpGroup(g)
+			c.mapper.processHTTPGroup(g)
 			c.groupTickets[key].Release()
 			delete(c.groupTickets, key)
 		} else if final {

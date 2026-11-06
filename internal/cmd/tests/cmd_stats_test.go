@@ -13,6 +13,7 @@ import (
 )
 
 func TestStatsCommandWithoutAddressFails(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	ts := NewGlobalTestState(t)
@@ -27,6 +28,7 @@ func TestStatsCommandWithoutAddressFails(t *testing.T) {
 }
 
 func TestStatsCommand(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	srv := getTestServer(t, map[string]http.Handler{

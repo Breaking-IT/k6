@@ -164,6 +164,18 @@ func (s *screenshotter) originalViewportSize(p *Page) (*Size, error) {
 	return &viewportSize, nil
 }
 
+// setViewportSize waits for a paint at the new size before capturing the compositor surface.
+// A device-metrics acknowledgement alone can leave the old surface in place briefly.
+func (s *screenshotter) setViewportSize(p *Page, size *Size) error {
+	if err := p.setViewportSize(s.ctx, size); err != nil {
+		return err
+	}
+	_, err := p.frameManager.MainFrame().evaluate(s.ctx, utilityWorld,
+		evalOptions{forceCallable: true, returnByValue: true},
+		`() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`)
+	return err
+}
+
 func (s *screenshotter) restoreViewport(p *Page, originalSize *EmulatedSize) error {
 	ctx, cancel := s.cleanupContext()
 	defer cancel()
@@ -321,7 +333,7 @@ func (s *screenshotter) screenshotElement(
 				err = errors.Join(err, fmt.Errorf("restoring viewport: %w", restoreErr))
 			}
 		}()
-		if err := h.frame.page.setViewportSize(s.ctx, overriddenViewportSize); err != nil {
+		if err := s.setViewportSize(h.frame.page, overriddenViewportSize); err != nil {
 			return nil, fmt.Errorf("setting viewport size to %s: %w",
 				overriddenViewportSize, err)
 		}
@@ -401,7 +413,7 @@ func (s *screenshotter) screenshotPage(p *Page, opts *PageScreenshotOptions) (bu
 						viewportSize, restoreErr))
 				}
 			}()
-			if err := p.setViewportSize(s.ctx, fullPageSize); err != nil {
+			if err := s.setViewportSize(p, fullPageSize); err != nil {
 				return nil, fmt.Errorf("setting viewport size to %s: %w",
 					fullPageSize, err)
 			}
