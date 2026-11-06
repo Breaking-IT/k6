@@ -3,7 +3,6 @@ package breakingit
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -79,7 +78,7 @@ func decodeDBBatch(t *testing.T, data []byte, content string) map[string][][][]b
 	}
 	return result
 }
-func TestBreakTestDBBinaryMatchesCSVMapping(t *testing.T) {
+func TestBreakTestDBBinaryMatchesProxyMapping(t *testing.T) {
 	t.Parallel()
 	rows := []struct {
 		table string
@@ -108,20 +107,13 @@ func TestBreakTestDBBinaryMatchesCSVMapping(t *testing.T) {
 	require.Len(t, decoded["requests_error"][0][15], 16)
 	require.Equal(t, []byte{1}, decoded["transactions"][0][4])
 	require.Equal(t, int64(846676800123456), int64(binary.BigEndian.Uint64(decoded["requests_raw"][0][0])))
-	// Transaction mapping itself is shared and byte-for-byte equivalent before encoding.
-	legacy := newTransactionTestLogger(false)
+	// The transaction row must be byte-identical on both binary COPY paths.
+	proxy := newTransactionTestLogger(false)
 	sample := transactionTestSample("group_duration", map[string]string{"group": "::Checkout"}, true)
-	legacy.AddMetricSamples([]metrics.SampleContainer{sample})
-	expected, err := csv.NewReader(legacy.bufTrans).Read()
-	require.NoError(t, err)
-	var actual []string
-	c.mapper.rowSink = func(table string, row []string) error {
-		require.Equal(t, "transactions", table)
-		actual = row
-		return nil
-	}
+	proxy.AddMetricSamples([]metrics.SampleContainer{sample})
 	c.AddMetricSamples([]metrics.SampleContainer{sample})
-	require.Equal(t, expected, actual)
+	require.NotEmpty(t, proxy.bufTrans.Bytes())
+	require.Equal(t, proxy.bufTrans.Bytes(), c.parts["transactions"].Bytes())
 }
 
 func TestBreakTestDBRetriesExactBytesAndFinalDrain(t *testing.T) {

@@ -2,7 +2,7 @@
 
 The fork has two independent built-in outputs, in both normal and `lean` builds:
 
-- `timescaledb-breakingit`: the existing CSV/PG-proxy writer.
+- `timescaledb-breakingit`: the pg-proxy binary COPY writer.
 - `breaktest-db-breakingit`: direct zstd-compressed PostgreSQL binary COPY batches
   to the BreakTest BreakTest DB service. It does not contact PostgreSQL or PG-proxy.
 
@@ -30,7 +30,7 @@ cannot be redirected to another origin. Never pass the service admin token.
 `BREAKINGIT_TRANSACTION_SOURCE` and `CUSTOM_URL_PATTERNS` retain their existing
 mapping behavior. Native groups, legacy `pages`, requests, WebSocket/custom trend
 request rows, failed checks, browser errors and VUs use the existing mapping code.
-Unknown CSV fields remain NULL in the binary encoding, and negative/unavailable
+Empty fields remain NULL in the binary encoding, and negative/unavailable
 connect times become NULL. Error UUIDs are generated independently per output.
 
 The application selects the output from the frozen test backend, provisions all
@@ -111,14 +111,14 @@ go test -tags lean ./internal/cmd -run 'TestBuiltinOutputString|TestBreakTestDBA
 go test ./internal/cmd -run 'TestBuiltinOutputString|TestBreakTestDBAndTimescaleConstructors'
 go build -tags lean -o /tmp/k6-breaktest-db-writer .
 python3 ai-tests/breaktest-db/smoke.py --k6 /tmp/k6-breaktest-db-writer \
-  --image breaktest-storage-lab:local --lanes 4
+  --image breaktest-db:local --lanes 4
 python3 ai-tests/breaktest-db/smoke.py --k6 /tmp/k6-breaktest-db-writer --lanes 4 --restart-live
 ```
 
 The smoke test creates its own disposable Docker service and temporary directory,
 then runs both writers on the **same** metric stream. The TimescaleDB writer goes
-to an isolated CSV-capture server; it does not write an actual TimescaleDB database.
-The test compares every stored column against that CSV oracle, except independently
+to an isolated binary COPY capture server; it does not write an actual TimescaleDB database.
+The test compares every stored column against the independently decoded proxy rows, except independently
 generated error UUIDs. It checks request, transaction, error and VU counts, complete
 sealing and reads after storage-service restart. It never connects to existing
 customer databases. This establishes protocol/mapping compatibility, not a

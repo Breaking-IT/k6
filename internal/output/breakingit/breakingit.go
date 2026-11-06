@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -63,24 +62,25 @@ const (
 
 // Logger writes k6 metric samples to pg-proxy using COPY via multipart batch
 type Logger struct {
-	rowSink     func(string, []string) error
-	flushMu     sync.Mutex
-	flushErr    error
-	cleanupDone chan struct{}
-	out         io.Writer
-	proxyURL    string
-	database    string
-	token       string
-	httpClient  *http.Client
+	rowSink    func(string, []string) error // direct BreakTest DB delivery, when configured
+	flushMu    sync.Mutex                   // serialize sends, including the final drain
+	flushErr   error                        // first exhausted delivery, guarded by flushMu
+	out        io.Writer
+	proxyURL   string
+	database   string
+	token      string
+	httpClient *http.Client
 
 	// batch buffers
-	mu         sync.Mutex
-	bufHTTP    *bytes.Buffer
-	bufVUs     *bytes.Buffer
-	bufTrans   *bytes.Buffer
-	bufErrors  *bytes.Buffer
-	batchTimer *time.Timer
-	flushing   bool // flag to prevent recursive flush calls
+	mu          sync.Mutex
+	bufHTTP     *bytes.Buffer
+	bufVUs      *bytes.Buffer
+	bufTrans    *bytes.Buffer
+	bufErrors   *bytes.Buffer
+	batchTimer  *time.Timer
+	firstData   chan struct{}
+	firstQueued bool
+	cleanupDone chan struct{}
 
 	// pending screenshots to upsert via /upsert endpoint (low-volume)
 	pendingScreenshots [][]any
@@ -167,13 +167,14 @@ func New(params output.Params) (output.Output, error) {
 		bufErrors:         &bytes.Buffer{},
 		pendingHTTPGroups: make(map[int64]*MetricGroup),
 		cleanupStop:       make(chan struct{}),
-		cleanupDone:       make(chan struct{}),
 		batchDone:         make(chan struct{}),
 		envTags:           envTags,
 		customPatterns:    customPatterns,
 		isSynthetic:       isSynthetic,
 		transactionSource: transactionSource,
 	}
+	l.firstData = make(chan struct{}, 1)
+	l.cleanupDone = make(chan struct{})
 	l.batchTimer = time.NewTimer(time.Second)
 	go l.batchLoop()
 	go l.cleanupProcessor()
@@ -188,11 +189,10 @@ func (l *Logger) Start() error { return nil }
 
 // Stop flushes remaining samples and stops background processing.
 func (l *Logger) Stop() error {
-	l.batchTimer.Stop()
 	close(l.cleanupStop)
-	<-l.batchDone
 	<-l.cleanupDone
-	// Cleanup can own a detached metric group; join it before draining the tail.
+	<-l.batchDone
+	// Finish incomplete groups before the final batch.
 	l.mu.Lock()
 	groups := l.pendingHTTPGroups
 	l.pendingHTTPGroups = make(map[int64]*MetricGroup)
@@ -200,26 +200,33 @@ func (l *Logger) Stop() error {
 	for _, g := range groups {
 		l.processHTTPGroup(g)
 	}
-	l.flush()
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+	for l.flushOnce() {
+		// Drain rows accepted during the preceding send.
+	}
 	return l.flushErr
 }
 
 func (l *Logger) batchLoop() {
 	defer close(l.batchDone)
-	for {
+	defer l.batchTimer.Stop()
+	select {
+	case <-l.firstData:
+	case <-l.cleanupStop:
+		return
+	}
+	if !l.batchTimer.Stop() {
 		select {
-		case _, ok := <-l.batchTimer.C:
-			if !ok {
-				return
-			}
-			l.flush()
-			if l.isSynthetic {
-				l.batchTimer.Reset(5 * time.Second)
-			} else {
-				l.batchTimer.Reset(time.Second)
-			}
+		case <-l.batchTimer.C:
+		default:
+		}
+	}
+	for {
+		l.flush()
+		l.batchTimer.Reset(time.Second)
+		select {
+		case <-l.batchTimer.C:
 		case <-l.cleanupStop:
 			return
 		}
@@ -252,53 +259,32 @@ func (l *Logger) cleanupProcessor() {
 	}
 }
 
-// A single owner drains every accepted tail batch. Stop must join that owner;
-// spawning a follow-up goroutine lets Stop return while rows are still in flight.
 func (l *Logger) flush() {
 	l.flushMu.Lock()
 	defer l.flushMu.Unlock()
-	for {
-		l.flushOnce()
-		l.mu.Lock()
-		more := l.flushErr == nil && (l.bufHTTP.Len() > 0 || l.bufVUs.Len() > 0 || l.bufTrans.Len() > 0 || l.bufErrors.Len() > 0 || len(l.pendingScreenshots) > 0)
-		l.mu.Unlock()
-		if !more {
-			return
-		}
-	}
+	l.flushOnce()
 }
 
-func (l *Logger) flushOnce() {
+// flushOnce sends one detached batch. The caller holds flushMu.
+func (l *Logger) flushOnce() bool {
 	l.mu.Lock()
-	// Prevent recursive flush calls
-	if l.flushing {
-		l.mu.Unlock()
-		return
-	}
 	hasBatchData := l.bufHTTP.Len() > 0 || l.bufVUs.Len() > 0 || l.bufTrans.Len() > 0 || l.bufErrors.Len() > 0
 	hasScreenshots := len(l.pendingScreenshots) > 0
 	if !hasBatchData && !hasScreenshots {
 		l.mu.Unlock()
-		return
+		return false
 	}
 
-	// Snapshot buffer data and lengths for retry attempts
-	bufHTTPSnapshot := make([]byte, l.bufHTTP.Len())
-	copy(bufHTTPSnapshot, l.bufHTTP.Bytes())
-	bufHTTPLen := l.bufHTTP.Len()
-	bufVUsSnapshot := make([]byte, l.bufVUs.Len())
-	copy(bufVUsSnapshot, l.bufVUs.Bytes())
-	bufVUsLen := l.bufVUs.Len()
-	bufTransSnapshot := make([]byte, l.bufTrans.Len())
-	copy(bufTransSnapshot, l.bufTrans.Bytes())
-	bufTransLen := l.bufTrans.Len()
-	bufErrorsSnapshot := make([]byte, l.bufErrors.Len())
-	copy(bufErrorsSnapshot, l.bufErrors.Bytes())
-	bufErrorsLen := l.bufErrors.Len()
+	// Transfer ownership so producers can fill the next batch during network I/O.
+	bufHTTPSnapshot := l.bufHTTP.Bytes()
+	bufVUsSnapshot := l.bufVUs.Bytes()
+	bufTransSnapshot := l.bufTrans.Bytes()
+	bufErrorsSnapshot := l.bufErrors.Bytes()
+	l.bufHTTP, l.bufVUs = &bytes.Buffer{}, &bytes.Buffer{}
+	l.bufTrans, l.bufErrors = &bytes.Buffer{}, &bytes.Buffer{}
 	// Snapshot pending screenshots
 	screenshotsSnapshot := l.pendingScreenshots
 	l.pendingScreenshots = nil
-	l.flushing = true
 	l.mu.Unlock()
 
 	// Send screenshots via upsert endpoint (separate from batch COPY path)
@@ -309,42 +295,13 @@ func (l *Logger) flushOnce() {
 	}
 
 	// Skip batch if no COPY data
-	if !hasBatchData {
-		l.mu.Lock()
-		l.flushing = false
-		l.mu.Unlock()
-		return
-	}
-
-	body, boundary := l.batchBody(bufHTTPSnapshot, bufVUsSnapshot, bufTransSnapshot, bufErrorsSnapshot)
-	success := l.sendBatch(body, boundary)
-
-	// Reset buffers and check for new data that accumulated during retries
-	l.mu.Lock()
-	if !success {
-		l.flushErr = fmt.Errorf("pg-proxy delivery failed after retries")
-	}
-	for _, item := range []struct {
-		buffer *bytes.Buffer
-		sent   int
-	}{
-		{l.bufHTTP, bufHTTPLen},
-		{l.bufVUs, bufVUsLen},
-		{l.bufTrans, bufTransLen},
-		{l.bufErrors, bufErrorsLen},
-	} {
-		if success {
-			item.buffer.Next(item.sent)
-
-		} else {
-			// Preserve the existing bounded-memory policy after exhausted retries.
-			item.buffer.Reset()
+	if hasBatchData {
+		body, boundary := l.batchBody(bufHTTPSnapshot, bufVUsSnapshot, bufTransSnapshot, bufErrorsSnapshot)
+		if err := l.sendBatch(body, boundary); err != nil && l.flushErr == nil {
+			l.flushErr = err
 		}
 	}
-
-	l.flushing = false
-	l.mu.Unlock()
-
+	return true
 }
 
 // upsertScreenshots sends screenshots to the pg-proxy upsert endpoint.
@@ -487,16 +444,16 @@ func (l *Logger) processHTTPGroup(g *MetricGroup) {
 
 	// response_size from browser_data_received when present (browser only); k6 HTTP has no per-request
 	// size in this group
-	responseSize := ""
+	var responseSize any = ""
 	if v, ok := g.Values["data_received"]; ok && v >= 0 {
-		responseSize = fmtInt(v)
+		responseSize = int64(v)
 	}
 
-	var row []string
+	var row []any
 	if l.isSynthetic {
 		// SM table has run_id last (existing table order)
-		row = []string{
-			time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, g.Timestamp),
 			g.Tags["scenario_name"],
 			g.Tags["location"],
 			g.Tags["node_name"],
@@ -513,8 +470,8 @@ func (l *Logger) processHTTPGroup(g *MetricGroup) {
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 		}
 	} else {
-		row = []string{
-			time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, g.Timestamp),
 			g.Tags["run_id"],
 			g.Tags["location"],
 			transactionName,
@@ -569,13 +526,13 @@ func (l *Logger) processWebSocketMetric(s metrics.Sample, ts int64) {
 	}
 
 	// response_time is the metric value
-	responseTime := fmtInt(s.Value)
+	responseTime := int64(s.Value)
 
-	var row []string
+	var row []any
 	if l.isSynthetic {
 		// SM requests_raw_sm (existing table: run_id last)
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			tags["scenario_name"],
 			tags["location"],
 			tags["node_name"],
@@ -594,8 +551,8 @@ func (l *Logger) processWebSocketMetric(s metrics.Sample, ts int64) {
 	} else {
 		// Non-SM: time, run_id, location, transaction_name, sampler_name, success, request_size,
 		// response_size, response_code, response_connect_time, response_latency, response_time
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			tags["run_id"],
 			tags["location"],
 			transactionName,
@@ -651,13 +608,13 @@ func (l *Logger) processCustomTrendMetric(s metrics.Sample, ts int64) {
 	success := "true"
 
 	// response_time is the metric value
-	responseTime := fmtInt(s.Value)
+	responseTime := int64(s.Value)
 
-	var row []string
+	var row []any
 	if l.isSynthetic {
 		// SM requests_raw_sm (existing table: run_id last)
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			tags["scenario_name"],
 			tags["location"],
 			tags["node_name"],
@@ -676,8 +633,8 @@ func (l *Logger) processCustomTrendMetric(s metrics.Sample, ts int64) {
 	} else {
 		// Non-SM: time, run_id, location, transaction_name, sampler_name, success, request_size,
 		// response_size, response_code, response_connect_time, response_latency, response_time
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			tags["run_id"],
 			tags["location"],
 			transactionName,
@@ -738,11 +695,11 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 	// captured in the same flush snapshot (prevents the error row referencing
 	// a hash that was never sent to sm_screenshots).
 	if l.isSynthetic {
-		row := []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano), // time
-			fmt.Sprintf("%v", l.envTags["scenario_name"]),   // scenario_name
-			fmt.Sprintf("%v", l.envTags["location"]),        // location
-			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
+		row := []any{
+			time.Unix(0, ts), // time
+			fmt.Sprintf("%v", l.envTags["scenario_name"]), // scenario_name
+			fmt.Sprintf("%v", l.envTags["location"]),      // location
+			fmt.Sprintf("%v", l.envTags["node_name"]),     // node_name
 			m["scenario"],                          // thread_group_name
 			transactionName,                        // transaction_name
 			samplerName,                            // sampler_name
@@ -768,23 +725,23 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()
 	} else {
-		row := []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano), // time
-			fmt.Sprintf("%v", l.envTags["run_id"]),          // run_id
-			fmt.Sprintf("%v", l.envTags["location"]),        // location
-			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
-			transactionName, // transaction_name
-			samplerName,     // sampler_name
-			"",              // response_code
-			"",              // response_time
-			"",              // connection_time
-			"",              // url
-			"",              // assertions
-			errMsg,          // response_message
-			"",              // request_headers
-			"",              // response_headers
-			screenshotHash,  // response_data (screenshot hash reference)
-			id,              // id (UUIDv7)
+		row := []any{
+			time.Unix(0, ts),                          // time
+			fmt.Sprintf("%v", l.envTags["run_id"]),    // run_id
+			fmt.Sprintf("%v", l.envTags["location"]),  // location
+			fmt.Sprintf("%v", l.envTags["node_name"]), // node_name
+			transactionName,                           // transaction_name
+			samplerName,                               // sampler_name
+			"",                                        // response_code
+			"",                                        // response_time
+			"",                                        // connection_time
+			"",                                        // url
+			"",                                        // assertions
+			errMsg,                                    // response_message
+			"",                                        // request_headers
+			"",                                        // response_headers
+			screenshotHash,                            // response_data (screenshot hash reference)
+			id,                                        // id (UUIDv7)
 		}
 		l.mu.Lock()
 		if screenshotHash != "" {
@@ -796,8 +753,6 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 		l.mu.Unlock()
 	}
 }
-
-func fmtInt(v float64) string { return fmt.Sprintf("%d", int64(v)) }
 
 // generateUUIDv7 generates a UUIDv7 using the provided timestamp (nanoseconds since Unix epoch)
 func generateUUIDv7(timestampNanos int64) string {
@@ -1010,10 +965,10 @@ func (l *Logger) processPageSample(s metrics.Sample, ts int64) {
 	// SM transactions_sm (run_id last): time, scenario_name, location, node_name, thread_group_name,
 	// transaction_name, success, request_size, response_size, response_time, run_id
 	isSM := l.isSynthetic
-	var row []string
+	var row []any
 	if isSM {
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			fmt.Sprintf("%v", l.envTags["scenario_name"]),
 			fmt.Sprintf("%v", l.envTags["location"]),
 			fmt.Sprintf("%v", l.envTags["node_name"]),
@@ -1022,19 +977,19 @@ func (l *Logger) processPageSample(s metrics.Sample, ts int64) {
 			"true",
 			"",
 			"",
-			fmtInt(s.Value),
+			int64(s.Value),
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 		}
 	} else {
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 			fmt.Sprintf("%v", l.envTags["location"]),
 			transactionName,
 			"true",
 			"",
 			"",
-			fmtInt(s.Value),
+			int64(s.Value),
 		}
 	}
 	l.mu.Lock()
@@ -1055,11 +1010,11 @@ func (l *Logger) processGroupSample(s metrics.Sample, ts int64) {
 		nameRaw = "/"
 	}
 	isSM := l.isSynthetic
-	var row []string
+	var row []any
 	if isSM {
 		// SM transactions_sm (run_id last)
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			fmt.Sprintf("%v", l.envTags["scenario_name"]),
 			fmt.Sprintf("%v", l.envTags["location"]),
 			fmt.Sprintf("%v", l.envTags["node_name"]),
@@ -1068,19 +1023,19 @@ func (l *Logger) processGroupSample(s metrics.Sample, ts int64) {
 			success,
 			"",
 			"",
-			fmtInt(s.Value),
+			int64(s.Value),
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 		}
 	} else {
-		row = []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+		row = []any{
+			time.Unix(0, ts),
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 			fmt.Sprintf("%v", l.envTags["location"]),
 			nameRaw,
 			success,
 			"",
 			"",
-			fmtInt(s.Value),
+			int64(s.Value),
 		}
 	}
 	l.mu.Lock()
@@ -1089,14 +1044,14 @@ func (l *Logger) processGroupSample(s metrics.Sample, ts int64) {
 }
 
 func (l *Logger) processVUsSample(s metrics.Sample, ts int64) {
-	row := []string{
-		time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+	row := []any{
+		time.Unix(0, ts),
 		fmt.Sprintf("%v", l.envTags["run_id"]),
 		fmt.Sprintf("%v", l.envTags["location"]),
 		fmt.Sprintf("%v", l.envTags["node_name"]),
-		fmt.Sprintf("%d", int64(s.Value)), // active_threads
-		"",                                // started_threads (unknown)
-		"",                                // finished_threads (unknown)
+		int64(s.Value), // active_threads
+		"",             // started_threads (unknown)
+		"",             // finished_threads (unknown)
 	}
 	l.mu.Lock()
 	l.writeRow(l.bufVUs, row)
@@ -1132,11 +1087,11 @@ func (l *Logger) processCheckSample(s metrics.Sample, ts int64) {
 	// Build row per schema (includes id field)
 	if l.isSynthetic {
 		// SM requests_error_sm (existing table: run_id last): time, scenario_name, ..., id, run_id
-		row := []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano), // time
-			fmt.Sprintf("%v", l.envTags["scenario_name"]),   // scenario_name
-			fmt.Sprintf("%v", l.envTags["location"]),        // location
-			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
+		row := []any{
+			time.Unix(0, ts), // time
+			fmt.Sprintf("%v", l.envTags["scenario_name"]), // scenario_name
+			fmt.Sprintf("%v", l.envTags["location"]),      // location
+			fmt.Sprintf("%v", l.envTags["node_name"]),     // node_name
 			m["scenario"],                          // thread_group_name
 			transactionName,                        // transaction_name
 			samplerName,                            // sampler_name
@@ -1156,23 +1111,23 @@ func (l *Logger) processCheckSample(s metrics.Sample, ts int64) {
 		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()
 	} else {
-		row := []string{
-			time.Unix(0, ts).UTC().Format(time.RFC3339Nano), // time
-			fmt.Sprintf("%v", l.envTags["run_id"]),          // run_id
-			fmt.Sprintf("%v", l.envTags["location"]),        // location
-			fmt.Sprintf("%v", l.envTags["node_name"]),       // node_name
-			transactionName, // transaction_name
-			samplerName,     // sampler_name
-			responseCode,    // response_code
-			responseTime,    // response_time
-			"",              // connection_time
-			url,             // url
-			"",              // assertions
-			checkMsg,        // response_message
-			requestData,     // request_headers (used for request data)
-			"",              // response_headers
-			responseData,    // response_data
-			id,              // id (UUIDv7 generated from measurement timestamp)
+		row := []any{
+			time.Unix(0, ts),                          // time
+			fmt.Sprintf("%v", l.envTags["run_id"]),    // run_id
+			fmt.Sprintf("%v", l.envTags["location"]),  // location
+			fmt.Sprintf("%v", l.envTags["node_name"]), // node_name
+			transactionName,                           // transaction_name
+			samplerName,                               // sampler_name
+			responseCode,                              // response_code
+			responseTime,                              // response_time
+			"",                                        // connection_time
+			url,                                       // url
+			"",                                        // assertions
+			checkMsg,                                  // response_message
+			requestData,                               // request_headers (used for request data)
+			"",                                        // response_headers
+			responseData,                              // response_data
+			id,                                        // id (UUIDv7 generated from measurement timestamp)
 		}
 		l.mu.Lock()
 		l.writeRow(l.bufErrors, row)
@@ -1183,8 +1138,9 @@ func (l *Logger) processCheckSample(s metrics.Sample, ts int64) {
 func (l *Logger) batchBody(
 	bufHTTPSnapshot, bufVUsSnapshot, bufTransSnapshot, bufErrorsSnapshot []byte,
 ) ([]byte, string) {
-	var body bytes.Buffer
-	mw := multipart.NewWriter(&body)
+	var gzBody bytes.Buffer
+	gz, _ := gzip.NewWriterLevel(&gzBody, gzip.BestSpeed)
+	mw := multipart.NewWriter(gz)
 
 	if len(bufHTTPSnapshot) > 0 {
 		h := make(textproto.MIMEHeader)
@@ -1193,16 +1149,20 @@ func (l *Logger) batchBody(
 			table = "public.requests_raw_sm"
 		}
 		h.Set("X-Table", table)
-		h.Set("X-Format", "csv")
+		h.Set("X-Format", "binary")
 		pw, _ := mw.CreatePart(h)
-		_, _ = io.Copy(pw, bytes.NewReader(bufHTTPSnapshot))
+		_, _ = pw.Write([]byte(binaryCopyHeader))
+		_, _ = pw.Write(bufHTTPSnapshot)
+		_, _ = pw.Write([]byte{0xff, 0xff})
 	}
 	if len(bufVUsSnapshot) > 0 && !l.isSynthetic {
 		h := make(textproto.MIMEHeader)
 		h.Set("X-Table", "public.virtual_users")
-		h.Set("X-Format", "csv")
+		h.Set("X-Format", "binary")
 		pw, _ := mw.CreatePart(h)
-		_, _ = io.Copy(pw, bytes.NewReader(bufVUsSnapshot))
+		_, _ = pw.Write([]byte(binaryCopyHeader))
+		_, _ = pw.Write(bufVUsSnapshot)
+		_, _ = pw.Write([]byte{0xff, 0xff})
 	}
 	if len(bufTransSnapshot) > 0 {
 		h := make(textproto.MIMEHeader)
@@ -1211,9 +1171,11 @@ func (l *Logger) batchBody(
 			table = "public.transactions_sm"
 		}
 		h.Set("X-Table", table)
-		h.Set("X-Format", "csv")
+		h.Set("X-Format", "binary")
 		pw, _ := mw.CreatePart(h)
-		_, _ = io.Copy(pw, bytes.NewReader(bufTransSnapshot))
+		_, _ = pw.Write([]byte(binaryCopyHeader))
+		_, _ = pw.Write(bufTransSnapshot)
+		_, _ = pw.Write([]byte{0xff, 0xff})
 	}
 	if len(bufErrorsSnapshot) > 0 {
 		h := make(textproto.MIMEHeader)
@@ -1222,38 +1184,35 @@ func (l *Logger) batchBody(
 			table = "public.requests_error_sm"
 		}
 		h.Set("X-Table", table)
-		h.Set("X-Format", "csv")
+		h.Set("X-Format", "binary")
 		pw, _ := mw.CreatePart(h)
-		_, _ = io.Copy(pw, bytes.NewReader(bufErrorsSnapshot))
+		_, _ = pw.Write([]byte(binaryCopyHeader))
+		_, _ = pw.Write(bufErrorsSnapshot)
+		_, _ = pw.Write([]byte{0xff, 0xff})
 	}
 	_ = mw.Close()
 
-	// gzip body
-	var gzBody bytes.Buffer
-	gz := gzip.NewWriter(&gzBody)
-	_, _ = gz.Write(body.Bytes())
 	_ = gz.Close()
 
 	return gzBody.Bytes(), mw.Boundary()
 }
 
-func (l *Logger) sendBatch(body []byte, boundary string) bool {
+func (l *Logger) sendBatch(body []byte, boundary string) error {
 	start := time.Now()
 	delay := time.Duration(initialBackoffMs) * time.Millisecond
-	for attempts := 1; time.Since(start) < maxRetryTimeMs*time.Millisecond; attempts++ {
+	for attempts := 1; ; attempts++ {
 		err := l.postBatch(body, boundary)
 		if err == nil {
-			return true
+			return nil
 		}
 		elapsed := time.Since(start)
 		_, _ = fmt.Fprintf(l.out, "pg-proxy ingest attempt %d failed (%v elapsed): %v\n", attempts, elapsed, err)
 		if elapsed+delay >= maxRetryTimeMs*time.Millisecond {
-			break
+			return fmt.Errorf("pg-proxy delivery failed after %d attempts: %w", attempts, err)
 		}
 		time.Sleep(delay)
 		delay = min(delay*2, maxBackoffMs*time.Millisecond)
 	}
-	return false
 }
 
 func (l *Logger) postBatch(body []byte, boundary string) error {
@@ -1279,7 +1238,7 @@ func (l *Logger) postBatch(body []byte, boundary string) error {
 
 // writeHTTPError requires the buffer lock to be held by the caller.
 func (l *Logger) writeHTTPError(g *MetricGroup,
-	transactionName, samplerName, responseCode, responseTime, connectTime string, isBrowser bool,
+	transactionName, samplerName, responseCode string, responseTime, connectTime int64, isBrowser bool,
 ) {
 	// Build response_message from tags
 	errText := fmt.Sprintf("%v", g.Tags["error"]) // may be empty
@@ -1329,8 +1288,8 @@ func (l *Logger) writeHTTPError(g *MetricGroup,
 	id := generateUUIDv7(g.Timestamp)
 	if l.isSynthetic {
 		// SM requests_error_sm (existing table: run_id last): time, scenario_name, ..., id, run_id
-		erow := []string{
-			time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
+		erow := []any{
+			time.Unix(0, g.Timestamp),
 			g.Tags["scenario_name"],
 			g.Tags["location"],
 			g.Tags["node_name"],
@@ -1351,8 +1310,8 @@ func (l *Logger) writeHTTPError(g *MetricGroup,
 		}
 		l.writeRow(l.bufErrors, erow)
 	} else {
-		erow := []string{
-			time.Unix(0, g.Timestamp).UTC().Format(time.RFC3339Nano),
+		erow := []any{
+			time.Unix(0, g.Timestamp),
 			g.Tags["run_id"],
 			g.Tags["location"],
 			g.Tags["node_name"],
@@ -1463,29 +1422,38 @@ func parseCustomPatterns(out io.Writer, patterns string) map[string]string {
 }
 
 // requestTimings converts k6 timings to the JMeter-style fields expected by BreakTest.
-func requestTimings(values map[string]float64) (connectTime, latency, responseTime string) {
+func requestTimings(values map[string]float64) (connectTime, latency, responseTime int64) {
 	connect := values["http_req_connecting"] + values["http_req_tls_handshaking"]
-	return fmtInt(connect),
-		fmtInt(connect + values["http_req_sending"] + values["http_req_waiting"]),
-		fmtInt(connect + values["http_req_duration"])
+	return int64(connect),
+		int64(connect + values["http_req_sending"] + values["http_req_waiting"]),
+		int64(connect + values["http_req_duration"])
 }
 
-// writeRow preserves one mapping for both storage backends. Call with mu held.
-func (l *Logger) writeRow(buf *bytes.Buffer, row []string) {
-	if l.rowSink != nil {
-		table := "requests_raw"
-		switch buf {
-		case l.bufTrans:
-			table = "transactions"
-		case l.bufVUs:
-			table = "virtual_users"
-		case l.bufErrors:
-			table = "requests_error"
-		}
-		_ = l.rowSink(table, row) // Sink records failures and stops the run.
+// writeRow routes the shared metric mapping to the selected storage writer with mu held.
+func (l *Logger) writeRow(buf *bytes.Buffer, row []any) {
+	if l.rowSink == nil {
+		l.writeBinaryRow(buf, row)
 		return
 	}
-	w := csv.NewWriter(buf)
-	_ = w.Write(row)
-	w.Flush()
+	table := "requests_raw"
+	switch buf {
+	case l.bufTrans:
+		table = "transactions"
+	case l.bufVUs:
+		table = "virtual_users"
+	case l.bufErrors:
+		table = "requests_error"
+	}
+	fields := make([]string, len(row))
+	for i, value := range row {
+		switch v := value.(type) {
+		case time.Time:
+			fields[i] = v.UTC().Format(time.RFC3339Nano)
+		case string:
+			fields[i] = v
+		default:
+			fields[i] = fmt.Sprint(v)
+		}
+	}
+	_ = l.rowSink(table, fields) // The direct writer records failures and stops the run.
 }

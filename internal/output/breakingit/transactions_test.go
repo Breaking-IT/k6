@@ -3,7 +3,6 @@ package breakingit
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"mime"
@@ -58,7 +57,7 @@ func TestTransactionRows(t *testing.T) {
 		{"native success", "group_duration", "01_Home", map[string]string{"group": "::01_Home"}, false},
 		{"native failure", "group_duration", "02_Pay", map[string]string{"group": "::02_Pay"}, true},
 		{"nested", "group_duration", "Checkout::Payment", map[string]string{"group": "::Checkout::Payment"}, true},
-		{"CSV escaping", "group_duration", "A,\"B\"\nC", map[string]string{"group": "::A,\"B\"\nC"}, false},
+		{"special characters", "group_duration", "A,\"B\"\nC", map[string]string{"group": "::A,\"B\"\nC"}, false},
 		{"group fallback", "group_duration", "fallback", map[string]string{"name": "fallback"}, false},
 		{"group default", "group_duration", "/", nil, false},
 	}
@@ -70,7 +69,7 @@ func TestTransactionRows(t *testing.T) {
 				sample := transactionTestSample(test.metric, test.tags, test.failed)
 				sample.Tags = sample.Tags.With("scenario", "browser_checkout")
 				l.AddMetricSamples([]metrics.SampleContainer{sample})
-				rows, err := csv.NewReader(l.bufTrans).ReadAll()
+				rows, err := readBinaryRows(l.bufTrans, map[bool]string{false: "tsssbiii", true: "tsssssbiiiu"}[l.isSynthetic], false)
 				require.NoError(t, err)
 				expected := []string{
 					"2026-09-24T12:00:00.123Z", "run-123", "Amsterdam", test.expectedName,
@@ -80,7 +79,7 @@ func TestTransactionRows(t *testing.T) {
 					expected = []string{
 						"2026-09-24T12:00:00.123Z", "checkout", "Amsterdam", "node-1",
 						"browser_checkout", test.expectedName, fmt.Sprint(!test.failed),
-						"", "", "123", "run-123",
+						"", "", "123", syntheticRunUUID("run-123").String(),
 					}
 				}
 				assert.Equal(t, [][]string{expected}, rows)
@@ -110,7 +109,7 @@ func TestTransactionSource(t *testing.T) {
 				transactionTestSample("pages", map[string]string{"page": "legacy"}, false),
 				transactionTestSample("group_duration", map[string]string{"group": "::native"}, false),
 			}})
-			rows, err := csv.NewReader(l.bufTrans).ReadAll()
+			rows, err := readBinaryRows(l.bufTrans, map[bool]string{false: "tsssbiii", true: "tsssssbiiiu"}[l.isSynthetic], false)
 			require.NoError(t, err)
 			var names []string
 			for _, row := range rows {
@@ -121,7 +120,7 @@ func TestTransactionSource(t *testing.T) {
 			check := transactionTestSample("checks", map[string]string{"group": "::native", "check": "bad"}, false)
 			check.Value = 0
 			l.AddMetricSamples([]metrics.SampleContainer{check})
-			errors, err := csv.NewReader(l.bufErrors).ReadAll()
+			errors, err := readBinaryRows(l.bufErrors, map[bool]string{false: "tssssssiissssssu", true: "tsssssssiissssssuu"}[l.isSynthetic], false)
 			require.NoError(t, err)
 			require.Len(t, errors, 1)
 			assert.Equal(t, "native", errors[0][4])
@@ -163,7 +162,7 @@ func TestBrowserRequestKeepsExplicitGroup(t *testing.T) {
 			l.processHTTPGroup(&MetricGroup{
 				Tags: map[string]string{"group": test.group, "path": test.path, "resource_type": "Document"},
 			})
-			rows, err := csv.NewReader(l.bufHTTP).ReadAll()
+			rows, err := readBinaryRows(l.bufHTTP, map[bool]string{false: "tssssbiisiii", true: "tssssssbiisiiiu"}[l.isSynthetic], false)
 			require.NoError(t, err)
 			require.Len(t, rows, 1)
 			index := 3
@@ -203,8 +202,8 @@ func TestTransactionsSentToProxy(t *testing.T) {
 					w.WriteHeader(http.StatusOK)
 					return
 				}
-				assert.Equal(t, "csv", part.Header.Get("X-Format"))
-				rows, err := csv.NewReader(part).ReadAll()
+				assert.Equal(t, "binary", part.Header.Get("X-Format"))
+				rows, err := readBinaryRows(part, map[bool]string{false: "tsssbiii", true: "tsssssbiiiu"}[synthetic], true)
 				assert.NoError(t, err)
 				batches <- batch{part.Header.Get("X-Table"), rows}
 				_, err = reader.NextPart()

@@ -277,6 +277,10 @@ type Options struct {
 	// Include HTTP request/response headers and bodies in output metadata for failed requests.
 	HTTPErrorData null.Bool `json:"httpErrorData" envconfig:"K6_HTTP_ERROR_DATA"`
 
+	// Carry the request URL in sample metadata when a manually set `name` tag has
+	// replaced it in the indexed `url` tag, so outputs can still see it.
+	HTTPRequestURL null.Bool `json:"httpRequestUrl" envconfig:"K6_HTTP_REQUEST_URL"`
+
 	// Accept invalid or untrusted TLS certificates.
 	InsecureSkipTLSVerify null.Bool `json:"insecureSkipTLSVerify" envconfig:"K6_INSECURE_SKIP_TLS_VERIFY"`
 
@@ -454,6 +458,9 @@ func (o Options) Apply(opts Options) Options {
 	}
 	if opts.HTTPErrorData.Valid {
 		o.HTTPErrorData = opts.HTTPErrorData
+	}
+	if opts.HTTPRequestURL.Valid {
+		o.HTTPRequestURL = opts.HTTPRequestURL
 	}
 	if opts.InsecureSkipTLSVerify.Valid {
 		o.InsecureSkipTLSVerify = opts.InsecureSkipTLSVerify

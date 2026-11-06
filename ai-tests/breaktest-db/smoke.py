@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Isolated k6 -> Rust protocol test with the existing CSV writer as an oracle.
+"""Isolated k6 -> Rust protocol test with the pg-proxy binary COPY writer as an oracle.
 
 Requires Docker, Python 3, a built k6 fork and a built BreakTest DB service image.
 Creates a temporary service/container and directory; never connects to customer DBs.
 """
 import argparse
-import csv
 import email.parser
 import gzip
 import http.server
@@ -14,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import struct
 import socket
 import html
 import subprocess
@@ -22,7 +22,47 @@ import threading
 import time
 import urllib.request
 import uuid
-from datetime import datetime
+
+
+
+def copy_rows(table, payload):
+    schemas = {
+        "requests_raw": "tssssbiisiii",
+        "transactions": "tsssbiii",
+        "requests_error": "tssssssiissssssu",
+        "virtual_users": "tsssiii",
+    }
+    schema = schemas[table]
+    stream = io.BytesIO(payload)
+    if stream.read(19) != b"PGCOPY\n\xff\r\n\x00" + bytes(8):
+        raise ValueError("Invalid binary COPY header")
+    while True:
+        count, = struct.unpack(">h", stream.read(2))
+        if count == -1:
+            if stream.read(1):
+                raise ValueError("Trailing bytes after COPY data")
+            return
+        if count != len(schema):
+            raise ValueError(f"Unexpected {table} row width {count}")
+        row = []
+        for kind in schema:
+            size, = struct.unpack(">i", stream.read(4))
+            if size == -1:
+                row.append(None)
+                continue
+            if size < 0:
+                raise ValueError("Invalid COPY field length")
+            field = stream.read(size)
+            if len(field) != size:
+                raise ValueError("Truncated COPY field")
+            if kind == "s":
+                value = field.decode()
+            elif kind == "u":
+                value = str(uuid.UUID(bytes=field))
+            else:
+                value, = struct.unpack({"i": ">i", "t": ">q", "b": ">?"}[kind], field)
+            row.append(value)
+        yield row
 
 
 def run(args):
@@ -63,7 +103,9 @@ def run(args):
                 + self.headers["Content-Type"].encode() + b"\r\n\r\n" + data)
             for part in msg.get_payload():
                 table = part["X-Table"].removeprefix("public.")
-                rows = csv.reader(io.StringIO(part.get_payload(decode=True).decode()))
+                if part["X-Format"] != "binary":
+                    raise ValueError(f"Expected binary COPY for {table}")
+                rows = copy_rows(table, part.get_payload(decode=True))
                 oracle.setdefault(table, []).extend(rows)
             self.send_response(200)
             self.end_headers()
@@ -199,13 +241,11 @@ export default async function(){
                 else:
                     assert counts[table] > 0
                 # Match all fields including timestamp, except independently-generated UUIDs.
-                def normalized(row, csv_row=False):
+                def normalized(row):
                     values = []
                     for i, value in enumerate(row):
                         if table == "requests_error" and i == 15:
                             continue
-                        if csv_row and i == 0:
-                            value = round((datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() - 946684800) * 1_000_000)
                         if value is None or value == "":
                             value = None
                         elif isinstance(value, bool):
@@ -215,7 +255,7 @@ export default async function(){
                         values.append(value)
                     return json.dumps(values, ensure_ascii=False)
                 left = sorted(normalized(row) for row in actual["rows"])
-                right = sorted(normalized(row, True) for row in oracle[table])
+                right = sorted(normalized(row) for row in oracle[table])
                 if args.restart_live:
                     from collections import Counter
                     assert not (Counter(left)-Counter(right)), (table,'duplicate or corrupted recovered rows')

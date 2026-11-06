@@ -2,17 +2,20 @@ package breakingit
 
 import (
 	"compress/gzip"
+	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.k6.io/k6/v2/metrics"
 	"go.k6.io/k6/v2/output"
 )
 
@@ -48,9 +51,15 @@ func TestTimescaleStopJoinsFollowupFlush(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			body, _ := io.ReadAll(part)
+			assert.Equal(t, "binary", part.Header.Get("X-Format"))
+			assert.Equal(t, "public.transactions", part.Header.Get("X-Table"))
+			rows, err := readBinaryRows(part, "tsssbiii", true)
+			if !assert.NoError(t, err) || !assert.Len(t, rows, 1) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			mu.Lock()
-			received = append(received, strings.TrimSpace(string(body)))
+			received = append(received, rows[0][3])
 			n := len(received)
 			mu.Unlock()
 			if n == 1 {
@@ -70,7 +79,10 @@ func TestTimescaleStopJoinsFollowupFlush(t *testing.T) {
 	out, err := New(output.Params{ConfigArgument: server.URL, StdOut: io.Discard, Environment: map[string]string{"PG_PROXY_TOKEN": "test-token"}})
 	require.NoError(t, err)
 	l := out.(*Logger)
-	appendRow := func(row string) { l.mu.Lock(); l.bufHTTP.WriteString(row + "\n"); l.mu.Unlock() }
+	appendRow := func(name string) {
+		sample := transactionTestSample("group_duration", map[string]string{"group": "::" + name}, false)
+		l.AddMetricSamples([]metrics.SampleContainer{sample})
+	}
 	await := func(ch <-chan struct{}) {
 		select {
 		case <-ch:
@@ -79,7 +91,6 @@ func TestTimescaleStopJoinsFollowupFlush(t *testing.T) {
 		}
 	}
 	appendRow("first")
-	go l.flush()
 	await(first)
 	appendRow("second")
 	onceFirst.Do(func() { close(releaseFirst) })
@@ -128,4 +139,23 @@ func TestTimescaleStopDrainsUnexpiredMetricGroup(t *testing.T) {
 	defer mu.Unlock()
 	require.Equal(t, 1, requests)
 	require.Empty(t, l.pendingHTTPGroups)
+}
+
+type unavailableProxy struct{}
+
+func (unavailableProxy) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("proxy offline")
+}
+
+func TestTimescaleStopReportsExhaustedDelivery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out, err := New(output.Params{ConfigArgument: "http://proxy.test", StdOut: io.Discard,
+			Environment: map[string]string{"PG_PROXY_TOKEN": "test-token"}})
+		require.NoError(t, err)
+		logger := out.(*Logger)
+		logger.httpClient.Transport = unavailableProxy{}
+		sample := transactionTestSample("group_duration", map[string]string{"group": "::tail"}, false)
+		logger.AddMetricSamples([]metrics.SampleContainer{sample})
+		require.ErrorContains(t, logger.Stop(), "proxy offline")
+	})
 }
