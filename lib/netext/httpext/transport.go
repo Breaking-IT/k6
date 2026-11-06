@@ -17,6 +17,11 @@ import (
 	"go.k6.io/k6/v2/metrics"
 )
 
+// MetadataRequestURL is the sample metadata key holding the URL of a request
+// whose `url` tag was replaced by a manually set `name` tag. Written only when
+// the HTTPRequestURL option is enabled.
+const MetadataRequestURL = "request_url"
+
 // transport is an implementation of http.RoundTripper that will measure and emit
 // different metrics for each roundtrip
 type transport struct {
@@ -104,6 +109,15 @@ func (t *transport) measureAndEmitMetrics(unfReq *unfinishedRequest) *finishedRe
 		// whatever they set as the value of the `url` tags too, to prevent
 		// high-cardinality values in the indexed tags.
 		tagsAndMeta.SetSystemTagOrMetaIfEnabled(enabledTags, metrics.TagURL, nameTagValue)
+
+		// That overwrite loses the URL: nothing else in the metric stream carries
+		// it, so an output cannot report which URL a named request actually hit.
+		// Metadata is where it can be kept without paying the cardinality cost the
+		// overwrite exists to avoid - it is not indexed in atlas. Only set here,
+		// because in the branch above the `url` tag already holds the real URL.
+		if t.state.Options.HTTPRequestURL.Bool {
+			tagsAndMeta.SetMetadata(MetadataRequestURL, cleanURL)
+		}
 	}
 
 	tagsAndMeta.SetSystemTagOrMetaIfEnabled(enabledTags, metrics.TagMethod, unfReq.request.Method)
