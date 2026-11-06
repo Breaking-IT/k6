@@ -23,6 +23,8 @@ code to the k6 executable.
 ## Fork-specific changes
 
 - Adds the `timescaledb-breakingit` output for writing load-test data through a PG-proxy.
+- Adds the opt-in `breaktest-db-breakingit` direct output alongside TimescaleDB; see
+  [configuration and current limits](internal/output/breakingit/BREAKTEST_DB.md).
 - Adds optional detailed request and response data for failed HTTP requests.
 - Adds the optional `httpRequestUrl` option to keep a named request's real URL in sample metadata.
 - Extends browser network and error metrics, including optional error screenshots.

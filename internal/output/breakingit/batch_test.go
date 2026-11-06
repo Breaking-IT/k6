@@ -64,9 +64,5 @@ func TestBatchRetryPreservesConcurrentSamples(t *testing.T) {
 			t.Fatal("missing batch")
 		}
 	}
-	require.Eventually(t, func() bool {
-		logger.mu.Lock()
-		defer logger.mu.Unlock()
-		return !logger.flushing && logger.bufTrans.Len() == 0
-	}, 5*time.Second, 10*time.Millisecond)
+	require.Empty(t, logger.bufTrans.Bytes())
 }

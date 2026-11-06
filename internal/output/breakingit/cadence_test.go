@@ -25,7 +25,7 @@ func TestFirstBatchImmediateThenOneSecond(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			}))
 			defer server.Close()
-			exporter, err := New(output.Params{ConfigArgument: server.URL, StdOut: io.Discard, Environment: map[string]string{"PG_PROXY_TOKEN": "test", "isSynthetic": fmt.Sprint(synthetic)}})
+			exporter, err := New(output.Params{ConfigArgument: server.URL, StdOut: io.Discard, Environment: map[string]string{"PG_PROXY_TOKEN": "test", "syntheticMonitoring": fmt.Sprint(synthetic)}})
 			require.NoError(t, err)
 			stopped := false
 			defer func() {

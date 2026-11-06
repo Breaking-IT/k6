@@ -62,6 +62,9 @@ const (
 
 // Logger writes k6 metric samples to pg-proxy using COPY via multipart batch
 type Logger struct {
+	rowSink    func(string, []string) error // direct BreakTest DB delivery, when configured
+	flushMu    sync.Mutex                   // serialize sends, including the final drain
+	flushErr   error                        // first exhausted delivery, guarded by flushMu
 	out        io.Writer
 	proxyURL   string
 	database   string
@@ -78,7 +81,6 @@ type Logger struct {
 	firstData   chan struct{}
 	firstQueued bool
 	cleanupDone chan struct{}
-	flushing    bool // flag to prevent recursive flush calls
 
 	// pending screenshots to upsert via /upsert endpoint (low-volume)
 	pendingScreenshots [][]any
@@ -191,11 +193,19 @@ func (l *Logger) Stop() error {
 	<-l.cleanupDone
 	<-l.batchDone
 	// Finish incomplete groups before the final batch.
-	for _, g := range l.pendingHTTPGroups {
+	l.mu.Lock()
+	groups := l.pendingHTTPGroups
+	l.pendingHTTPGroups = make(map[int64]*MetricGroup)
+	l.mu.Unlock()
+	for _, g := range groups {
 		l.processHTTPGroup(g)
 	}
-	l.flush()
-	return nil
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+	for l.flushOnce() {
+		// Drain rows accepted during the preceding send.
+	}
+	return l.flushErr
 }
 
 func (l *Logger) batchLoop() {
@@ -250,17 +260,19 @@ func (l *Logger) cleanupProcessor() {
 }
 
 func (l *Logger) flush() {
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+	l.flushOnce()
+}
+
+// flushOnce sends one detached batch. The caller holds flushMu.
+func (l *Logger) flushOnce() bool {
 	l.mu.Lock()
-	// Prevent recursive flush calls
-	if l.flushing {
-		l.mu.Unlock()
-		return
-	}
 	hasBatchData := l.bufHTTP.Len() > 0 || l.bufVUs.Len() > 0 || l.bufTrans.Len() > 0 || l.bufErrors.Len() > 0
 	hasScreenshots := len(l.pendingScreenshots) > 0
 	if !hasBatchData && !hasScreenshots {
 		l.mu.Unlock()
-		return
+		return false
 	}
 
 	// Transfer ownership so producers can fill the next batch during network I/O.
@@ -273,7 +285,6 @@ func (l *Logger) flush() {
 	// Snapshot pending screenshots
 	screenshotsSnapshot := l.pendingScreenshots
 	l.pendingScreenshots = nil
-	l.flushing = true
 	l.mu.Unlock()
 
 	// Send screenshots via upsert endpoint (separate from batch COPY path)
@@ -284,18 +295,13 @@ func (l *Logger) flush() {
 	}
 
 	// Skip batch if no COPY data
-	if !hasBatchData {
-		l.mu.Lock()
-		l.flushing = false
-		l.mu.Unlock()
-		return
+	if hasBatchData {
+		body, boundary := l.batchBody(bufHTTPSnapshot, bufVUsSnapshot, bufTransSnapshot, bufErrorsSnapshot)
+		if err := l.sendBatch(body, boundary); err != nil && l.flushErr == nil {
+			l.flushErr = err
+		}
 	}
-
-	body, boundary := l.batchBody(bufHTTPSnapshot, bufVUsSnapshot, bufTransSnapshot, bufErrorsSnapshot)
-	l.sendBatch(body, boundary)
-	l.mu.Lock()
-	l.flushing = false
-	l.mu.Unlock()
+	return true
 }
 
 // upsertScreenshots sends screenshots to the pg-proxy upsert endpoint.
@@ -480,7 +486,7 @@ func (l *Logger) processHTTPGroup(g *MetricGroup) {
 		}
 	}
 	l.mu.Lock()
-	l.writeBinaryRow(l.bufHTTP, row)
+	l.writeRow(l.bufHTTP, row)
 	// If not successful, also emit into requests_error(_sm)
 	if success == "false" {
 		l.writeHTTPError(g, transactionName, samplerName, responseCode, responseTime, connectTime, isBrowser)
@@ -561,7 +567,7 @@ func (l *Logger) processWebSocketMetric(s metrics.Sample, ts int64) {
 		}
 	}
 	l.mu.Lock()
-	l.writeBinaryRow(l.bufHTTP, row)
+	l.writeRow(l.bufHTTP, row)
 	l.mu.Unlock()
 }
 
@@ -643,7 +649,7 @@ func (l *Logger) processCustomTrendMetric(s metrics.Sample, ts int64) {
 		}
 	}
 	l.mu.Lock()
-	l.writeBinaryRow(l.bufHTTP, row)
+	l.writeRow(l.bufHTTP, row)
 	l.mu.Unlock()
 }
 
@@ -716,7 +722,7 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 			})
 			_, _ = fmt.Fprintf(l.out, "[screenshot] queued for upsert, pendingScreenshots=%d\n", len(l.pendingScreenshots))
 		}
-		l.writeBinaryRow(l.bufErrors, row)
+		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()
 	} else {
 		row := []any{
@@ -743,7 +749,7 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 				screenshotHash, screenshot, "image/png", len(screenshot),
 			})
 		}
-		l.writeBinaryRow(l.bufErrors, row)
+		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()
 	}
 }
@@ -987,7 +993,7 @@ func (l *Logger) processPageSample(s metrics.Sample, ts int64) {
 		}
 	}
 	l.mu.Lock()
-	l.writeBinaryRow(l.bufTrans, row)
+	l.writeRow(l.bufTrans, row)
 	l.mu.Unlock()
 }
 
@@ -1033,7 +1039,7 @@ func (l *Logger) processGroupSample(s metrics.Sample, ts int64) {
 		}
 	}
 	l.mu.Lock()
-	l.writeBinaryRow(l.bufTrans, row)
+	l.writeRow(l.bufTrans, row)
 	l.mu.Unlock()
 }
 
@@ -1048,7 +1054,7 @@ func (l *Logger) processVUsSample(s metrics.Sample, ts int64) {
 		"",             // finished_threads (unknown)
 	}
 	l.mu.Lock()
-	l.writeBinaryRow(l.bufVUs, row)
+	l.writeRow(l.bufVUs, row)
 	l.mu.Unlock()
 }
 
@@ -1102,7 +1108,7 @@ func (l *Logger) processCheckSample(s metrics.Sample, ts int64) {
 			fmt.Sprintf("%v", l.envTags["run_id"]), // run_id last
 		}
 		l.mu.Lock()
-		l.writeBinaryRow(l.bufErrors, row)
+		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()
 	} else {
 		row := []any{
@@ -1124,7 +1130,7 @@ func (l *Logger) processCheckSample(s metrics.Sample, ts int64) {
 			id,                                        // id (UUIDv7 generated from measurement timestamp)
 		}
 		l.mu.Lock()
-		l.writeBinaryRow(l.bufErrors, row)
+		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()
 	}
 }
@@ -1191,23 +1197,22 @@ func (l *Logger) batchBody(
 	return gzBody.Bytes(), mw.Boundary()
 }
 
-func (l *Logger) sendBatch(body []byte, boundary string) bool {
+func (l *Logger) sendBatch(body []byte, boundary string) error {
 	start := time.Now()
 	delay := time.Duration(initialBackoffMs) * time.Millisecond
-	for attempts := 1; time.Since(start) < maxRetryTimeMs*time.Millisecond; attempts++ {
+	for attempts := 1; ; attempts++ {
 		err := l.postBatch(body, boundary)
 		if err == nil {
-			return true
+			return nil
 		}
 		elapsed := time.Since(start)
 		_, _ = fmt.Fprintf(l.out, "pg-proxy ingest attempt %d failed (%v elapsed): %v\n", attempts, elapsed, err)
 		if elapsed+delay >= maxRetryTimeMs*time.Millisecond {
-			break
+			return fmt.Errorf("pg-proxy delivery failed after %d attempts: %w", attempts, err)
 		}
 		time.Sleep(delay)
 		delay = min(delay*2, maxBackoffMs*time.Millisecond)
 	}
-	return false
 }
 
 func (l *Logger) postBatch(body []byte, boundary string) error {
@@ -1303,7 +1308,7 @@ func (l *Logger) writeHTTPError(g *MetricGroup,
 			id,                // id (UUIDv7)
 			fmt.Sprintf("%v", l.envTags["run_id"]),
 		}
-		l.writeBinaryRow(l.bufErrors, erow)
+		l.writeRow(l.bufErrors, erow)
 	} else {
 		erow := []any{
 			time.Unix(0, g.Timestamp),
@@ -1323,7 +1328,7 @@ func (l *Logger) writeHTTPError(g *MetricGroup,
 			g.ErrorResBody,    // response_data
 			id,                // id (UUIDv7)
 		}
-		l.writeBinaryRow(l.bufErrors, erow)
+		l.writeRow(l.bufErrors, erow)
 	}
 }
 
@@ -1422,4 +1427,33 @@ func requestTimings(values map[string]float64) (connectTime, latency, responseTi
 	return int64(connect),
 		int64(connect + values["http_req_sending"] + values["http_req_waiting"]),
 		int64(connect + values["http_req_duration"])
+}
+
+// writeRow routes the shared metric mapping to the selected storage writer with mu held.
+func (l *Logger) writeRow(buf *bytes.Buffer, row []any) {
+	if l.rowSink == nil {
+		l.writeBinaryRow(buf, row)
+		return
+	}
+	table := "requests_raw"
+	switch buf {
+	case l.bufTrans:
+		table = "transactions"
+	case l.bufVUs:
+		table = "virtual_users"
+	case l.bufErrors:
+		table = "requests_error"
+	}
+	fields := make([]string, len(row))
+	for i, value := range row {
+		switch v := value.(type) {
+		case time.Time:
+			fields[i] = v.UTC().Format(time.RFC3339Nano)
+		case string:
+			fields[i] = v
+		default:
+			fields[i] = fmt.Sprint(v)
+		}
+	}
+	_ = l.rowSink(table, fields) // The direct writer records failures and stops the run.
 }

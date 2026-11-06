@@ -286,7 +286,13 @@ func (m *NetworkManager) emitRequestMetrics(req *Request) {
 	})
 }
 
-func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) { //nolint:funlen
+func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request, completion browserCompletion) { //nolint:funlen
+	transferred := false
+	defer func() {
+		if !transferred {
+			completion.ticket.Release()
+		}
+	}()
 	state := m.vu.State()
 	if state == nil {
 		return // CDP events can arrive after iteration teardown.
@@ -368,67 +374,70 @@ func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) { //n
 		return
 	}
 
-	pushIfNotDone(m.vu.Context(), m.logger, state.Samples, k6metrics.ConnectedSamples{
+	bundle := k6metrics.ConnectedSamples{
 		Samples: []k6metrics.Sample{
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqDuration, Tags: tags},
 				Value:      timings.durationMs,
-				Time:       wallTime,
+				Time:       completion.at,
 				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqBlocked, Tags: tags},
 				Value:      timings.blocked,
-				Time:       wallTime,
+				Time:       completion.at,
 				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqConnecting, Tags: tags},
 				Value:      timings.connecting,
-				Time:       wallTime,
+				Time:       completion.at,
 				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqTLSHandshaking, Tags: tags},
 				Value:      timings.tlsHandshaking,
-				Time:       wallTime,
+				Time:       completion.at,
 				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqSending, Tags: tags},
 				Value:      timings.sending,
-				Time:       wallTime,
+				Time:       completion.at,
 				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqWaiting, Tags: tags},
 				Value:      timings.waiting,
-				Time:       wallTime,
+				Time:       completion.at,
 				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqReceiving, Tags: tags},
 				Value:      timings.receiving,
-				Time:       wallTime,
+				Time:       completion.at,
 				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserDataReceived, Tags: tags},
 				Value:      float64(bodySize),
-				Time:       wallTime,
+				Time:       completion.at,
 				Metadata:   tagsAndMeta.Metadata,
 			},
 		},
-	})
+	}
 
-	if resp != nil {
+	{
+		if resp == nil {
+			failed = 1
+		}
 		sample := k6metrics.Sample{
 			TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqFailed, Tags: tags},
 			Value:      failed,
-			Time:       wallTime,
+			Time:       completion.at,
 			Metadata:   tagsAndMeta.Metadata,
 		}
-		if failed == 1 {
+		if failed == 1 && resp != nil {
 			reqHeaders, reqBody := req.formatErrorRequestData()
 			sample.HTTPErrorReqHeaders = reqHeaders
 			sample.HTTPErrorReqBody = reqBody
@@ -438,10 +447,9 @@ func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) { //n
 			sample.HTTPErrorResHeaders = resHeaders
 			sample.HTTPErrorResBody = resBody
 		}
-		pushIfNotDone(m.vu.Context(), m.logger, state.Samples, k6metrics.ConnectedSamples{
-			Samples: []k6metrics.Sample{sample},
-		})
+		bundle.Samples = append(bundle.Samples, sample)
 	}
+	transferred = k6metrics.PushTrackedRequest(m.vu.Context(), state.Samples, completion.ticket, bundle)
 }
 
 type browserResponseTimings struct {
@@ -542,7 +550,13 @@ func (m *NetworkManager) calcReceiving(req *Request, t *network.ResourceTiming, 
 // ERR_CONNECTION_REFUSED). This ensures outputs like breakingit receive metrics for
 // failed navigations/requests. The failure reason (e.g. net::ERR_NAME_NOT_RESOLVED) is
 // added as the "error" tag so CSV and other outputs can show it.
-func (m *NetworkManager) emitRequestFailedMetrics(req *Request) {
+func (m *NetworkManager) emitRequestFailedMetrics(req *Request, completion browserCompletion) {
+	transferred := false
+	defer func() {
+		if !transferred {
+			completion.ticket.Release()
+		}
+	}()
 	state := m.vu.State()
 	if state == nil {
 		return
@@ -596,7 +610,7 @@ func (m *NetworkManager) emitRequestFailedMetrics(req *Request) {
 	} {
 		samples = append(samples, k6metrics.Sample{
 			TimeSeries: k6metrics.TimeSeries{Metric: metric, Tags: tags},
-			Time:       wallTime, Metadata: tagsAndMeta.Metadata,
+			Time:       completion.at, Metadata: tagsAndMeta.Metadata,
 		})
 	}
 	samples[0].Value = durationMs
@@ -604,7 +618,7 @@ func (m *NetworkManager) emitRequestFailedMetrics(req *Request) {
 	failed.Value = 1
 	failed.HTTPErrorReqHeaders = reqHeaders
 	failed.HTTPErrorReqBody = reqBody
-	k6metrics.PushIfNotDone(m.vu.Context(), state.Samples, k6metrics.ConnectedSamples{Samples: samples})
+	transferred = k6metrics.PushTrackedRequest(m.vu.Context(), state.Samples, completion.ticket, k6metrics.ConnectedSamples{Samples: samples})
 }
 
 // handleURLTag will check if the url tag needs to be grouped by testing
@@ -626,6 +640,7 @@ func handleURLTag(mi eventInterceptor, url string, method string, tags *k6metric
 func (m *NetworkManager) handleRequestRedirect(
 	req *Request, redirectResponse *network.Response, hasExtraInfo bool, timestamp *cdp.MonotonicTime,
 ) {
+	completion := m.beginBrowserCompletion()
 	resp := NewHTTPResponse(m.ctx, req, redirectResponse, timestamp)
 	m.extraInfoTracker.processResponse(req.requestID, resp, hasExtraInfo)
 	req.responseMu.Lock()
@@ -638,7 +653,7 @@ func (m *NetworkManager) handleRequestRedirect(
 	// them (the redirect's ExtraInfo may still be in flight here).
 	m.wg.Go(func() {
 		resp.WaitForRawHeaders()
-		m.emitResponseMetrics(resp, req)
+		m.emitResponseMetrics(resp, req, completion)
 	})
 	m.deleteRequestByID(req.requestID)
 
@@ -740,7 +755,7 @@ func (m *NetworkManager) onLoadingFailed(event *network.EventLoadingFailed) {
 
 	// Emit browser metrics for failed requests so outputs (e.g. breakingit) can store them.
 	if !isInternalURL(req.url) {
-		m.emitRequestFailedMetrics(req)
+		m.emitRequestFailedMetrics(req, m.beginBrowserCompletion())
 	}
 
 	m.eventInterceptor.onRequestFailed(req)
@@ -757,6 +772,7 @@ func (m *NetworkManager) onLoadingFinished(event *network.EventLoadingFinished) 
 		return
 	}
 
+	completion := m.beginBrowserCompletion()
 	req.responseEndWall = event.Timestamp.Time()
 	req.responseEndTiming = float64(event.Timestamp.Time().Sub(req.timestamp).Milliseconds())
 	req.encodedDataLength = int64(event.EncodedDataLength)
@@ -768,6 +784,7 @@ func (m *NetworkManager) onLoadingFinished(event *network.EventLoadingFinished) 
 
 	// Skip data and blob URLs when emitting metrics, since they're internal to the browser.
 	if isInternalURL(req.url) {
+		completion.ticket.Release()
 		return
 	}
 	// Emit the response metrics in a separate goroutine, once the raw headers
@@ -784,7 +801,7 @@ func (m *NetworkManager) onLoadingFinished(event *network.EventLoadingFinished) 
 		if resp != nil {
 			resp.WaitForRawHeaders()
 		}
-		m.emitResponseMetrics(resp, req)
+		m.emitResponseMetrics(resp, req, completion)
 	})
 }
 

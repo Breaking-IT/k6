@@ -84,7 +84,12 @@ func newTransport(
 // Helper method to finish the tracer trail, assemble the tag values and emits
 // the metric samples for the supplied unfinished request.
 func (t *transport) measureAndEmitMetrics(unfReq *unfinishedRequest) *finishedRequest {
+	ticket := metrics.BeginRequest(t.state.Samples)
 	trail := unfReq.tracer.Done()
+	if ticket != nil {
+		trail.EndTime = ticket.Time
+	}
+	trail.requestTicket = ticket
 
 	result := &finishedRequest{
 		unfinishedRequest: unfReq,
@@ -166,7 +171,9 @@ func (t *transport) measureAndEmitMetrics(unfReq *unfinishedRequest) *finishedRe
 		t.addFailedSample(trail, &tagsAndMeta, failed)
 	}
 
-	metrics.PushIfNotDone(t.ctx, t.state.Samples, trail)
+	if !metrics.PushIfNotDone(t.ctx, t.state.Samples, trail) {
+		ticket.Release()
+	}
 	return result
 }
 

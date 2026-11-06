@@ -134,3 +134,9 @@ so producers can fill the next batch during retries. Exhausted retries discard
 only the failed batch; newly collected rows remain queued for the next send.
 Synthetic run IDs use UUID binary fields, with the same deterministic fallback
 as JMeter for legacy identifiers that are not UUIDs.
+
+## BreakTest DB alternative
+
+The fork also includes `breaktest-db-breakingit` for direct binary delivery to the
+BreakTest DB service. See [configuration, delivery semantics and current
+limits](BREAKTEST_DB.md). The existing TimescaleDB output remains available.
