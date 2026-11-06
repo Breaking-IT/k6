@@ -17,6 +17,7 @@ import (
 const projectIDForTests = 42
 
 func TestCloudTestList(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	t.Run("lists tests successfully using --project-id", func(t *testing.T) {

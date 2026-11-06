@@ -183,7 +183,8 @@ func TestArchiveContainsEnv(t *testing.T) {
 
 	// then unpacked metadata should contain the environment variables with the proper values
 	require.NoError(t, json.Unmarshal(data, &metadata))
-	require.Len(t, metadata.Env, 2)
+	require.Len(t, metadata.Env, 3)
+	require.Equal(t, "async-metric-context", metadata.Env["K6_FEATURES"])
 
 	require.Contains(t, metadata.Env, "ENV1")
 	require.Contains(t, metadata.Env, "ENV2")

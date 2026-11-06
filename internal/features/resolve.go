@@ -31,6 +31,7 @@ func resolveInto(defs *definitions,
 	target reflect.Value,
 	cli, env, json Source,
 	logger logrus.FieldLogger,
+	defaults ...string,
 ) ([]string, error) {
 	if target.Type() != defs.typ {
 		return nil, fmt.Errorf("features: resolveInto target type %s does not match definition type %s",
@@ -48,8 +49,7 @@ func resolveInto(defs *definitions,
 	case json.Supplied:
 		winner, source = json, "json"
 	default:
-		forceGA(defs, target)
-		return []string{}, nil
+		winner, source = Source{Values: defaults}, "default"
 	}
 
 	activated := make(map[string]struct{})
@@ -90,7 +90,10 @@ func resolveInto(defs *definitions,
 
 		activated[name] = struct{}{}
 
-		logActivation(logger, name, defs.definitions[idx].flag.Lifecycle)
+		// Defaults must not add unsolicited INFO output, particularly for quiet runs.
+		if source != "default" {
+			logActivation(logger, name, defs.definitions[idx].flag.Lifecycle)
+		}
 	}
 
 	setFields(defs, target, activated)

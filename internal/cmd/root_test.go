@@ -60,6 +60,9 @@ func TestRootCommandHelpDisplayCommands(t *testing.T) {
 			ts.CmdArgs = []string{"k6", "help"}
 			newRootCommand(ts.GlobalState).execute()
 
+			if leanBuild && tc.name == "should have cloud command" {
+				tc.wantStdoutContains = "cloud       Cloud functionality is not available in this lean build"
+			}
 			if tc.wantStdoutContains != "" {
 				assert.Contains(t, ts.Stdout.String(), tc.wantStdoutContains)
 			}

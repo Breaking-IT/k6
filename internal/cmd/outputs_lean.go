@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"go.k6.io/k6/v2/cmd/state"
 	"go.k6.io/k6/v2/ext"
 	"go.k6.io/k6/v2/internal/output/breakingit"
 	"go.k6.io/k6/v2/internal/output/csv"
@@ -71,3 +72,5 @@ func getAllOutputConstructors() (map[string]output.Constructor, error) {
 
 	return result, nil
 }
+
+func attachCloudLogDrainer(_ output.Output, _ *state.GlobalState) {}

@@ -85,6 +85,7 @@ func uploadAndCaptureArchive(
 }
 
 func TestCloudRunPropagatesFeatureFlagsToWorker(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	archiveEnv, archive := uploadAndCaptureArchive(t,
@@ -105,6 +106,7 @@ func TestCloudRunPropagatesFeatureFlagsToWorker(t *testing.T) {
 }
 
 func TestCloudRunClearsInheritedFeatureFlags(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	archiveEnv, _ := uploadAndCaptureArchive(t,
@@ -115,6 +117,7 @@ func TestCloudRunClearsInheritedFeatureFlags(t *testing.T) {
 }
 
 func TestCloudRunPropagatesFeatureFlagFromEnv(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	// K6_FEATURES set in the process environment (not -e, not --features) must be
@@ -128,6 +131,7 @@ func TestCloudRunPropagatesFeatureFlagFromEnv(t *testing.T) {
 }
 
 func TestCloudRunPropagatesFeatureFlagFromLegacyAliasEnv(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	// A legacy alias env var set in the process environment must resolve to its
@@ -140,6 +144,7 @@ func TestCloudRunPropagatesFeatureFlagFromLegacyAliasEnv(t *testing.T) {
 }
 
 func TestCloudRunIgnoresFeatureFlagFromScriptOptions(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	// Features in the script's exported options are unsupported, so they must
@@ -153,6 +158,6 @@ export default function () {};`
 	archiveEnv, _ := uploadAndCaptureArchive(t,
 		[]string{"k6", "cloud", "run", "test.js"}, nil, script)
 
-	_, ok := archiveEnv["K6_FEATURES"]
-	assert.False(t, ok, "options.features must not convey to the worker")
+	assert.Equal(t, "async-metric-context", archiveEnv["K6_FEATURES"],
+		"only the fork default, not options.features, should convey to the worker")
 }

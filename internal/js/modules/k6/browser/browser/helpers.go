@@ -93,11 +93,17 @@ func newRegExMatcher(ctx context.Context, vu moduleVU, tq *taskqueue.TaskQueue) 
 //   - Otherwise, rejects the promise with the error fn returns
 //     and emits a browser_errors metric sample.
 func promise(vu moduleVU, fn func() (result any, reason error)) *sobek.Promise {
+	// Capture on the JS thread: an async group's context may be restored before
+	// fn fails in its goroutine. Never enter a runtime metric context there.
+	var tagsAndMeta k6metrics.TagsAndMeta
+	if state := vu.State(); k6common.AsyncMetricContextEnabled(state) {
+		tagsAndMeta = state.Tags.GetCurrentValues()
+	}
 	p, resolve, reject := promises.New(vu)
 	go func() {
 		v, err := fn()
 		if err != nil {
-			emitBrowserError(vu, err)
+			emitBrowserError(vu, err, tagsAndMeta)
 			reject(k6ext.BrowserError(err))
 			return
 		}
@@ -109,13 +115,15 @@ func promise(vu moduleVU, fn func() (result any, reason error)) *sobek.Promise {
 // emitBrowserError pushes a browser_errors metric sample with the error message as a tag.
 // When K6_BROWSER_SCREENSHOT_ON_ERROR is enabled, it also captures a screenshot of the
 // active page and includes it as a base64-encoded "screenshot" tag on the metric.
-func emitBrowserError(vu moduleVU, err error) {
+func emitBrowserError(vu moduleVU, err error, tagsAndMeta k6metrics.TagsAndMeta) {
 	state := vu.State()
 	if state == nil || vu.browserErrors == nil {
 		return
 	}
-	tags := state.Tags.GetCurrentValues().Tags
-	tags = tags.With("error", err.Error())
+	if tagsAndMeta.Tags == nil {
+		tagsAndMeta = state.Tags.GetCurrentValues()
+	}
+	tags := tagsAndMeta.Tags.With("error", err.Error())
 
 	if vu.screenshotOnError {
 		if screenshot := captureErrorScreenshot(vu); screenshot != "" {
@@ -130,6 +138,7 @@ func emitBrowserError(vu moduleVU, err error) {
 				TimeSeries: k6metrics.TimeSeries{Metric: vu.browserErrors, Tags: tags},
 				Value:      1,
 				Time:       now,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 		},
 	})
@@ -188,6 +197,17 @@ func queueTask[T any](
 			return zero, fmt.Errorf("running on task queue: %w", common.ContextErr(ctx))
 		}
 	}
+}
+
+func queueTaskWithMetricContext[T any](
+	ctx context.Context,
+	tq *taskqueue.TaskQueue,
+	captured k6common.CapturedMetricContext,
+	fn func() (T, error),
+) (future func() (T, error)) {
+	return queueTask(ctx, tq, func() (T, error) {
+		return k6common.RunWithMetricContext(captured, fn)
+	})
 }
 
 // newTaskQueue returns a new [taskqueue.TaskQueue] that is closed after

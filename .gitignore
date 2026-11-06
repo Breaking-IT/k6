@@ -9,6 +9,7 @@
 /.protoc
 /output.csv
 
+/build/
 
 .vscode
 *.sublime-workspace

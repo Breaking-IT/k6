@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"math"
 	"strings"
 	"text/tabwriter"
 
@@ -15,7 +14,6 @@ import (
 
 	"go.k6.io/k6/v2/cloudapi"
 	"go.k6.io/k6/v2/cmd/state"
-	"go.k6.io/k6/v2/internal/build"
 	v6cloudapi "go.k6.io/k6/v2/internal/cloudapi/v6"
 )
 
@@ -54,23 +52,9 @@ func getCmdCloudTestList(testCmd *cmdCloudTest) *cobra.Command {
 }
 
 func (c *cmdCloudTestList) run(cmd *cobra.Command, _ []string) error {
-	currentDiskConf, err := readDiskConfig(c.globalState)
+	client, cloudConfig, err := newCloudV6ClientFromConfig(
+		c.globalState, "Listing cloud tests requires auth settings")
 	if err != nil {
-		return err
-	}
-
-	currentJSONConfigRaw := currentDiskConf.Collectors["cloud"]
-
-	cloudConfig, warn, err := cloudapi.GetConsolidatedConfig(
-		currentJSONConfigRaw, c.globalState.Env, "", nil)
-	if err != nil {
-		return err
-	}
-	if warn != "" {
-		c.globalState.Logger.Warn(warn)
-	}
-
-	if err := checkCloudLoginFor(cloudConfig, "Listing cloud tests requires auth settings"); err != nil {
 		return err
 	}
 
@@ -78,23 +62,6 @@ func (c *cmdCloudTestList) run(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-
-	client, err := v6cloudapi.NewClient(
-		c.globalState.Logger,
-		cloudConfig.Token.String,
-		cloudConfig.Hostv6.String,
-		build.Version,
-		cloudConfig.Timeout.TimeDuration(),
-	)
-	if err != nil {
-		return err
-	}
-
-	if cloudConfig.StackID.Int64 < math.MinInt32 || cloudConfig.StackID.Int64 > math.MaxInt32 {
-		return fmt.Errorf("stack ID %d overflows int32", cloudConfig.StackID.Int64)
-	}
-	client.SetStackID(int32(cloudConfig.StackID.Int64))
-
 	tests, err := client.ListLoadTests(c.globalState.Ctx, projectID)
 	if err != nil {
 		return err
@@ -123,7 +90,7 @@ func (c *cmdCloudTestList) run(cmd *cobra.Command, _ []string) error {
 // shared resolveDefaultProjectID helper (config projectID, then the stack's
 // default project). Unlike `k6 cloud run`, listing needs a concrete project, so
 // a zero result is treated as an error.
-func (c *cmdCloudTestList) resolveProjectID(cloudConfig cloudapi.Config, projectIDSet bool) (int32, error) {
+func (c *cmdCloudTestList) resolveProjectID(cloudConfig cloudapi.Config, projectIDSet bool) (int64, error) {
 	if projectIDSet {
 		if c.projectID <= 0 {
 			return 0, errNoProjectConfigured
@@ -139,11 +106,7 @@ func (c *cmdCloudTestList) resolveProjectID(cloudConfig cloudapi.Config, project
 		return 0, errNoProjectConfigured
 	}
 
-	if id < math.MinInt32 || id > math.MaxInt32 {
-		return 0, fmt.Errorf("project ID %d overflows int32", id)
-	}
-
-	return int32(id), nil
+	return id, nil
 }
 
 func (c *cmdCloudTestList) outputJSON(tests []v6cloudapi.LoadTest) error {

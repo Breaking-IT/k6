@@ -64,7 +64,7 @@ func TestRunWithoutFeatureFlag(t *testing.T) {
 	tagged := runAndNativeHistTagged(t, ts)
 	assert.Empty(t, tagged, "no feature tag without activation")
 
-	assert.Nil(t, ts.Usage.Map()["features"])
+	assert.Equal(t, []string{"async-metric-context"}, ts.Usage.Map()["features"])
 
 	for _, e := range ts.LoggerHook.Drain() {
 		assert.NotEqual(t, "native-histograms", e.Data["feature"])
@@ -154,7 +154,8 @@ func TestRunWarnsOnScriptOptionsFeatures(t *testing.T) {
 
 	tagged := runAndNativeHistTagged(t, ts)
 	assert.Empty(t, tagged, "options.features must not activate the flag")
-	assert.Nil(t, ts.Usage.Map()["features"], "options.features must not contribute to telemetry")
+	assert.Equal(t, []string{"async-metric-context"}, ts.Usage.Map()["features"],
+		"only the fork default, not options.features, should be active")
 
 	var sawOptionsWarn bool
 	for _, e := range ts.LoggerHook.Drain() {

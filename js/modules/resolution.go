@@ -78,12 +78,11 @@ func (mr *ModuleResolver) initializeGoModule(name string) (sobek.ModuleRecord, e
 		mr.unknownModules = append(mr.unknownModules, name)
 		return &unknownModule{name: name, requested: make(map[string]struct{})}, nil
 	}
-	// we don't want to report extensions and we would have hit cache if this isn't the first time
-	if !strings.HasPrefix(name, "k6/x/") {
-		err := mr.usage.Strings("modules", name)
-		if err != nil {
-			mr.logger.WithError(err).Warnf("Error while reporting usage of module %q", name)
-		}
+	// We would have hit the cache if this isn't the first time, so each distinct
+	// module is recorded once. Extension identities are intentionally not
+	// distinguished from built-in module names in the anonymous usage report.
+	if err := mr.usage.Strings("modules", name); err != nil {
+		mr.logger.WithError(err).Warnf("Error while reporting usage of module %q", name)
 	}
 	k6m, ok := mod.(Module)
 	if !ok {

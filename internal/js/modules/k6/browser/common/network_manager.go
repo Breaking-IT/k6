@@ -17,6 +17,7 @@ import (
 
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/k6ext"
 
+	k6common "go.k6.io/k6/v2/js/common"
 	k6modules "go.k6.io/k6/v2/js/modules"
 	k6lib "go.k6.io/k6/v2/lib"
 	k6netext "go.k6.io/k6/v2/lib/netext"
@@ -33,7 +34,7 @@ import (
 // Credentials holds HTTP authentication credentials.
 type Credentials struct {
 	Username string `js:"username"`
-	Password string `js:"password"` //nolint:gosec
+	Password string `js:"password"`
 }
 
 // IsEmpty returns true if the credentials are empty.
@@ -80,6 +81,7 @@ type NetworkManager struct {
 	eventsWillBeSentMu            sync.RWMutex
 	reqIDToRequestPausedEvent     map[network.RequestID]*fetch.EventRequestPaused
 	eventsPausedMu                sync.RWMutex
+	extraInfoTracker              *extraInfoTracker
 
 	attemptedAuth map[fetch.RequestID]bool
 
@@ -125,6 +127,7 @@ func NewNetworkManager(
 		reqIDToRequest:                make(map[network.RequestID]*Request),
 		reqIDToRequestWillBeSentEvent: make(map[network.RequestID]*network.EventRequestWillBeSent),
 		reqIDToRequestPausedEvent:     make(map[network.RequestID]*fetch.EventRequestPaused),
+		extraInfoTracker:              newExtraInfoTracker(),
 		attemptedAuth:                 make(map[fetch.RequestID]bool),
 		extraHTTPHeaders:              make(map[string]string),
 		networkProfile:                NewNetworkProfile(),
@@ -208,10 +211,61 @@ func (m *NetworkManager) deleteRequestByID(reqID network.RequestID) {
 	delete(m.reqIDToRequest, reqID)
 }
 
+func (m *NetworkManager) networkTagsAndMeta(
+	state *k6lib.State,
+	event *network.EventRequestWillBeSent,
+	redirectChain []*Request,
+) (k6metrics.TagsAndMeta, *networkOperationContext) {
+	if !k6common.AsyncMetricContextEnabled(state) {
+		return k6metrics.TagsAndMeta{}, nil
+	}
+	if len(redirectChain) > 0 {
+		previous := redirectChain[len(redirectChain)-1]
+		operation := previous.networkOperation
+		if m.frameManager != nil && m.frameManager.page != nil {
+			_, bindLoaderContext := requestLoaderContext(event)
+			if bindLoaderContext {
+				m.frameManager.page.bindNetworkLoaderOperation(event.FrameID, event.LoaderID, operation)
+			}
+		}
+		return previous.tagsAndMeta, operation
+	}
+	if m.frameManager != nil && m.frameManager.page != nil {
+		preferLoaderContext, bindLoaderContext := requestLoaderContext(event)
+		if tagsAndMeta, operation, ok := m.frameManager.page.getNetworkTagsAndMetaForRequest(
+			event.FrameID, event.LoaderID, preferLoaderContext, bindLoaderContext,
+		); ok {
+			return tagsAndMeta, operation
+		}
+	}
+	return state.Tags.GetCurrentValues(), nil
+}
+
+func requestLoaderContext(event *network.EventRequestWillBeSent) (prefer, bind bool) {
+	bind = event.Type == network.ResourceTypeDocument
+	initiatorType := network.InitiatorTypeOther
+	if event.Initiator != nil {
+		initiatorType = event.Initiator.Type
+	}
+	// A loader identifies navigation and parser-driven resource traffic, but it is also shared by
+	// unrelated fetches later in the document. Keep script traffic on the operation fallback.
+	prefer = bind || initiatorType == network.InitiatorTypeParser ||
+		initiatorType == network.InitiatorTypePreload ||
+		initiatorType == network.InitiatorTypeSignedExchange
+	return prefer, bind
+}
+
 func (m *NetworkManager) emitRequestMetrics(req *Request) {
 	state := m.vu.State()
+	if state == nil {
+		return // CDP events can arrive after iteration teardown.
+	}
 
-	tags := state.Tags.GetCurrentValues().Tags
+	tagsAndMeta := req.tagsAndMeta
+	if tagsAndMeta.Tags == nil {
+		tagsAndMeta = state.Tags.GetCurrentValues()
+	}
+	tags := tagsAndMeta.Tags
 	if state.Options.SystemTags.Has(k6metrics.TagMethod) {
 		tags = tags.With("method", req.method)
 	}
@@ -226,13 +280,17 @@ func (m *NetworkManager) emitRequestMetrics(req *Request) {
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserDataSent, Tags: tags},
 				Value:      float64(req.Size().Total()),
 				Time:       req.wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 		},
 	})
 }
 
-func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) {
+func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) { //nolint:funlen
 	state := m.vu.State()
+	if state == nil {
+		return // CDP events can arrive after iteration teardown.
+	}
 
 	// In some scenarios we might not receive a ResponseReceived CDP event, in
 	// which case the response won't be created. So to emit as much metric data
@@ -269,7 +327,11 @@ func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) {
 			"response is nil url:%s method:%s", req.url, req.method)
 	}
 
-	tags := state.Tags.GetCurrentValues().Tags
+	tagsAndMeta := req.tagsAndMeta
+	if tagsAndMeta.Tags == nil {
+		tagsAndMeta = state.Tags.GetCurrentValues()
+	}
+	tags := tagsAndMeta.Tags
 	if state.Options.SystemTags.Has(k6metrics.TagMethod) {
 		tags = tags.With("method", req.method)
 	}
@@ -291,49 +353,7 @@ func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) {
 	tags = tags.With("from_service_worker", strconv.FormatBool(fromSvcWrk))
 	tags = tags.With("resource_type", req.ResourceType())
 
-	// CDP ResourceTiming: RequestTime is baseline (seconds); other fields are ms relative to it.
-	// k6 time metrics are emitted in milliseconds (see metrics.D), so we keep all timings in ms here.
-	// blocked = time until we could start sending (includes DNS, queue, connecting, tls) — same idea as k6 GetConn→GotConn.
-	var blocked, connecting, tlsHandshaking, sending, waiting, receiving, durationMs float64
-	if resp != nil && resp.timing != nil {
-		t := resp.timing
-		blocked = t.SendStart
-		if blocked < 0 {
-			blocked = 0
-		}
-		if t.SslStart > 0 {
-			connecting = t.SslStart - t.ConnectStart
-			tlsHandshaking = t.ConnectEnd - t.SslStart
-		} else {
-			connecting = t.ConnectEnd - t.ConnectStart
-		}
-		if connecting < 0 {
-			connecting = 0
-		}
-		if tlsHandshaking < 0 {
-			tlsHandshaking = 0
-		}
-
-		sending = t.SendEnd - t.SendStart
-		if sending < 0 {
-			sending = 0
-		}
-		waiting = t.ReceiveHeadersEnd - t.SendEnd
-		if waiting < 0 {
-			waiting = 0
-		}
-		// receiving = time from headers received to response complete.
-		// Primary approach: convert ResourceTiming.RequestTime (monotonic seconds since boot)
-		// to a Go time.Time using cdp.MonotonicTimeEpoch, then compute responseEnd in ms
-		// relative to RequestTime. This keeps everything in the ResourceTiming time base,
-		// avoiding the dependency on headersEndWall (which may be zero for cross-session
-		// iframe requests where onResponseReceived can't find the request).
-		const maxReasonableMs = 300000 // 5 minutes
-		receiving = m.calcReceiving(req, t, maxReasonableMs)
-		durationMs = sending + waiting + receiving // same as k6 http: exclude blocked/connecting/tls
-	} else {
-		durationMs = k6metrics.D(wallTime.Sub(req.wallTime))
-	}
+	timings := m.responseTimings(req, resp, wallTime)
 
 	// Requests served from cache (disk/memory/prefetch cache or a service
 	// worker) involved no network activity, so they are not emitted as
@@ -352,43 +372,51 @@ func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) {
 		Samples: []k6metrics.Sample{
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqDuration, Tags: tags},
-				Value:      durationMs,
+				Value:      timings.durationMs,
 				Time:       wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqBlocked, Tags: tags},
-				Value:      blocked,
+				Value:      timings.blocked,
 				Time:       wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqConnecting, Tags: tags},
-				Value:      connecting,
+				Value:      timings.connecting,
 				Time:       wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqTLSHandshaking, Tags: tags},
-				Value:      tlsHandshaking,
+				Value:      timings.tlsHandshaking,
 				Time:       wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqSending, Tags: tags},
-				Value:      sending,
+				Value:      timings.sending,
 				Time:       wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqWaiting, Tags: tags},
-				Value:      waiting,
+				Value:      timings.waiting,
 				Time:       wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqReceiving, Tags: tags},
-				Value:      receiving,
+				Value:      timings.receiving,
 				Time:       wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 			{
 				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserDataReceived, Tags: tags},
 				Value:      float64(bodySize),
 				Time:       wallTime,
+				Metadata:   tagsAndMeta.Metadata,
 			},
 		},
 	})
@@ -398,12 +426,13 @@ func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) {
 			TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqFailed, Tags: tags},
 			Value:      failed,
 			Time:       wallTime,
+			Metadata:   tagsAndMeta.Metadata,
 		}
 		if failed == 1 {
 			reqHeaders, reqBody := req.formatErrorRequestData()
 			sample.HTTPErrorReqHeaders = reqHeaders
 			sample.HTTPErrorReqBody = reqBody
-			// Fetch response body so error reporting includes it (formatErrorResponseData only uses already-loaded body otherwise).
+			// Fetch the response body for error reporting; formatting only uses an already-loaded body.
 			_ = resp.fetchBody()
 			resHeaders, resBody := resp.formatErrorResponseData()
 			sample.HTTPErrorResHeaders = resHeaders
@@ -413,6 +442,60 @@ func (m *NetworkManager) emitResponseMetrics(resp *Response, req *Request) {
 			Samples: []k6metrics.Sample{sample},
 		})
 	}
+}
+
+type browserResponseTimings struct {
+	blocked, connecting, tlsHandshaking, sending, waiting, receiving, durationMs float64
+}
+
+func (m *NetworkManager) responseTimings(
+	req *Request, resp *Response, wallTime time.Time,
+) browserResponseTimings {
+	// CDP ResourceTiming: RequestTime is baseline (seconds); other fields are ms relative to it.
+	// k6 time metrics are emitted in milliseconds (see metrics.D), so we keep all timings in ms here.
+	// Blocked includes DNS, queuing, connecting, and TLS: like k6 GetConn to GotConn.
+	var timings browserResponseTimings
+	if resp == nil || resp.timing == nil {
+		timings.durationMs = k6metrics.D(wallTime.Sub(req.wallTime))
+		return timings
+	}
+	t := resp.timing
+	timings.blocked = t.SendStart
+	if timings.blocked < 0 {
+		timings.blocked = 0
+	}
+	if t.SslStart > 0 {
+		timings.connecting = t.SslStart - t.ConnectStart
+		timings.tlsHandshaking = t.ConnectEnd - t.SslStart
+	} else {
+		timings.connecting = t.ConnectEnd - t.ConnectStart
+	}
+	if timings.connecting < 0 {
+		timings.connecting = 0
+	}
+	if timings.tlsHandshaking < 0 {
+		timings.tlsHandshaking = 0
+	}
+
+	timings.sending = t.SendEnd - t.SendStart
+	if timings.sending < 0 {
+		timings.sending = 0
+	}
+	timings.waiting = t.ReceiveHeadersEnd - t.SendEnd
+	if timings.waiting < 0 {
+		timings.waiting = 0
+	}
+	// receiving = time from headers received to response complete.
+	// Primary approach: convert ResourceTiming.RequestTime (monotonic seconds since boot)
+	// to a Go time.Time using cdp.MonotonicTimeEpoch, then compute responseEnd in ms
+	// relative to RequestTime. This keeps everything in the ResourceTiming time base,
+	// avoiding the dependency on headersEndWall (which may be zero for cross-session
+	// iframe requests where onResponseReceived can't find the request).
+	const maxReasonableMs = 300000 // 5 minutes
+	timings.receiving = m.calcReceiving(req, t, maxReasonableMs)
+	// Match k6 HTTP: duration excludes blocked, connecting, and TLS time.
+	timings.durationMs = timings.sending + timings.waiting + timings.receiving
+	return timings
 }
 
 // calcReceiving computes the receiving phase duration in milliseconds.
@@ -461,6 +544,9 @@ func (m *NetworkManager) calcReceiving(req *Request, t *network.ResourceTiming, 
 // added as the "error" tag so CSV and other outputs can show it.
 func (m *NetworkManager) emitRequestFailedMetrics(req *Request) {
 	state := m.vu.State()
+	if state == nil {
+		return
+	}
 	wallTime := time.Now()
 	url := req.url.String()
 
@@ -475,7 +561,11 @@ func (m *NetworkManager) emitRequestFailedMetrics(req *Request) {
 		}
 	}
 
-	tags := state.Tags.GetCurrentValues().Tags
+	tagsAndMeta := req.tagsAndMeta
+	if tagsAndMeta.Tags == nil {
+		tagsAndMeta = state.Tags.GetCurrentValues()
+	}
+	tags := tagsAndMeta.Tags
 	if state.Options.SystemTags.Has(k6metrics.TagMethod) {
 		tags = tags.With("method", req.method)
 	}
@@ -496,59 +586,25 @@ func (m *NetworkManager) emitRequestFailedMetrics(req *Request) {
 	durationMs := k6metrics.D(wallTime.Sub(req.wallTime))
 	reqHeaders, reqBody := req.formatErrorRequestData()
 
-	k6metrics.PushIfNotDone(m.vu.Context(), state.Samples, k6metrics.ConnectedSamples{
-		Samples: []k6metrics.Sample{
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqDuration, Tags: tags},
-				Value:      durationMs,
-				Time:       wallTime,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqBlocked, Tags: tags},
-				Value:      0,
-				Time:       wallTime,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqConnecting, Tags: tags},
-				Value:      0,
-				Time:       wallTime,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqTLSHandshaking, Tags: tags},
-				Value:      0,
-				Time:       wallTime,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqSending, Tags: tags},
-				Value:      0,
-				Time:       wallTime,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqWaiting, Tags: tags},
-				Value:      0,
-				Time:       wallTime,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqReceiving, Tags: tags},
-				Value:      0,
-				Time:       wallTime,
-			},
-			{
-				TimeSeries: k6metrics.TimeSeries{Metric: m.customMetrics.BrowserDataReceived, Tags: tags},
-				Value:      0,
-				Time:       wallTime,
-			},
-			{
-				TimeSeries:            k6metrics.TimeSeries{Metric: m.customMetrics.BrowserHTTPReqFailed, Tags: tags},
-				Value:                 1,
-				Time:                  wallTime,
-				HTTPErrorReqHeaders:   reqHeaders,
-				HTTPErrorReqBody:      reqBody,
-				HTTPErrorResHeaders:   "",
-				HTTPErrorResBody:      "",
-			},
-		},
-	})
+	samples := make([]k6metrics.Sample, 0, 9)
+	for _, metric := range []*k6metrics.Metric{
+		m.customMetrics.BrowserHTTPReqDuration, m.customMetrics.BrowserHTTPReqBlocked,
+		m.customMetrics.BrowserHTTPReqConnecting, m.customMetrics.BrowserHTTPReqTLSHandshaking,
+		m.customMetrics.BrowserHTTPReqSending, m.customMetrics.BrowserHTTPReqWaiting,
+		m.customMetrics.BrowserHTTPReqReceiving, m.customMetrics.BrowserDataReceived,
+		m.customMetrics.BrowserHTTPReqFailed,
+	} {
+		samples = append(samples, k6metrics.Sample{
+			TimeSeries: k6metrics.TimeSeries{Metric: metric, Tags: tags},
+			Time:       wallTime, Metadata: tagsAndMeta.Metadata,
+		})
+	}
+	samples[0].Value = durationMs
+	failed := &samples[len(samples)-1]
+	failed.Value = 1
+	failed.HTTPErrorReqHeaders = reqHeaders
+	failed.HTTPErrorReqBody = reqBody
+	k6metrics.PushIfNotDone(m.vu.Context(), state.Samples, k6metrics.ConnectedSamples{Samples: samples})
 }
 
 // handleURLTag will check if the url tag needs to be grouped by testing
@@ -568,15 +624,22 @@ func handleURLTag(mi eventInterceptor, url string, method string, tags *k6metric
 }
 
 func (m *NetworkManager) handleRequestRedirect(
-	req *Request, redirectResponse *network.Response, timestamp *cdp.MonotonicTime,
+	req *Request, redirectResponse *network.Response, hasExtraInfo bool, timestamp *cdp.MonotonicTime,
 ) {
 	resp := NewHTTPResponse(m.ctx, req, redirectResponse, timestamp)
+	m.extraInfoTracker.processResponse(req.requestID, resp, hasExtraInfo)
 	req.responseMu.Lock()
 	req.response = resp
 	req.responseMu.Unlock()
 	req.redirectChain = append(req.redirectChain, req)
 
-	m.emitResponseMetrics(resp, req)
+	// Emit the response metrics once the raw headers are resolved, off the
+	// event goroutine so the wait does not block the goroutine that resolves
+	// them (the redirect's ExtraInfo may still be in flight here).
+	m.wg.Go(func() {
+		resp.WaitForRawHeaders()
+		m.emitResponseMetrics(resp, req)
+	})
 	m.deleteRequestByID(req.requestID)
 
 	/*
@@ -613,8 +676,10 @@ func (m *NetworkManager) initEvents() {
 		cdproto.EventNetworkLoadingFailed,
 		cdproto.EventNetworkLoadingFinished,
 		cdproto.EventNetworkRequestWillBeSent,
+		cdproto.EventNetworkRequestWillBeSentExtraInfo,
 		cdproto.EventNetworkRequestServedFromCache,
 		cdproto.EventNetworkResponseReceived,
+		cdproto.EventNetworkResponseReceivedExtraInfo,
 		cdproto.EventFetchRequestPaused,
 		cdproto.EventFetchAuthRequired,
 	}, chHandler)
@@ -646,10 +711,14 @@ func (m *NetworkManager) handleEvents(in <-chan Event) bool {
 			m.onLoadingFinished(ev)
 		case *network.EventRequestWillBeSent:
 			m.onRequestWillBeSent(ev)
+		case *network.EventRequestWillBeSentExtraInfo:
+			m.onRequestWillBeSentExtraInfo(ev)
 		case *network.EventRequestServedFromCache:
 			m.onRequestServedFromCache(ev)
 		case *network.EventResponseReceived:
 			m.onResponseReceived(ev)
+		case *network.EventResponseReceivedExtraInfo:
+			m.onResponseReceivedExtraInfo(ev)
 		case *fetch.EventRequestPaused:
 			m.onRequestPaused(ev)
 		case *fetch.EventAuthRequired:
@@ -676,6 +745,8 @@ func (m *NetworkManager) onLoadingFailed(event *network.EventLoadingFailed) {
 
 	m.eventInterceptor.onRequestFailed(req)
 	m.deleteRequestByID(event.RequestID)
+	m.extraInfoTracker.loadingFailed(event.RequestID)
+	req.resolveRawHeaders()
 	m.frameManager.requestFailed(req, event.Canceled)
 }
 
@@ -690,6 +761,8 @@ func (m *NetworkManager) onLoadingFinished(event *network.EventLoadingFinished) 
 	req.responseEndTiming = float64(event.Timestamp.Time().Sub(req.timestamp).Milliseconds())
 	req.encodedDataLength = int64(event.EncodedDataLength)
 	m.deleteRequestByID(event.RequestID)
+	m.extraInfoTracker.loadingFinished(event.RequestID)
+	req.resolveRawHeaders()
 	m.frameManager.requestFinished(req)
 	m.eventInterceptor.onRequestFinished(req)
 
@@ -697,26 +770,21 @@ func (m *NetworkManager) onLoadingFinished(event *network.EventLoadingFinished) 
 	if isInternalURL(req.url) {
 		return
 	}
-	emitResponseMetrics := func() {
-		req.responseMu.RLock()
-		m.emitResponseMetrics(req.response, req)
-		req.responseMu.RUnlock()
-	}
-	if !req.allowInterception {
-		emitResponseMetrics()
-		return
-	}
-	// When request interception is enabled, we need to process requestPaused messages
-	// from CDP in order to get the response for the request. However, we can't process
-	// them until the request is unblocked. Since we're blocking the NetworkManager
-	// goroutine here, we need to spawn a new goroutine to allow the requestPaused
-	// messages to be processed by the NetworkManager.
-	//
-	// This happens when the main page request redirects before it finishes loading.
-	// So the new redirect request will be blocked until the main page finishes loading.
-	// The main page will wait forever since its subrequest is blocked.
+	// Emit the response metrics in a separate goroutine, once the raw headers
+	// are resolved, so the reported size is computed from a stable source.
+	// This must not run on the NetworkManager event goroutine: waiting for the
+	// raw headers there would block the goroutine that resolves them. Spawning
+	// a goroutine is also required for intercepted requests, so that CDP
+	// requestPaused messages can still be processed while a redirected main
+	// page request waits for its subrequest to finish loading.
 	m.wg.Go(func() {
-		emitResponseMetrics()
+		req.responseMu.RLock()
+		resp := req.response
+		req.responseMu.RUnlock()
+		if resp != nil {
+			resp.WaitForRawHeaders()
+		}
+		m.emitResponseMetrics(resp, req)
 	})
 }
 
@@ -765,12 +833,13 @@ func (m *NetworkManager) onRequest(event *network.EventRequestWillBeSent,
 	if event.RedirectResponse != nil {
 		req, ok := m.requestFromID(event.RequestID)
 		if ok {
-			m.handleRequestRedirect(req, event.RedirectResponse, event.Timestamp)
+			m.handleRequestRedirect(req, event.RedirectResponse, event.RedirectHasExtraInfo, event.Timestamp)
 			redirectChain = req.redirectChain
 		}
 	} else {
 		redirectChain = make([]*Request, 0)
 	}
+	tagsAndMeta, networkOperation := m.networkTagsAndMeta(m.vu.State(), event, redirectChain)
 
 	var frame *Frame = nil
 	var ok bool
@@ -807,6 +876,8 @@ func (m *NetworkManager) onRequest(event *network.EventRequestWillBeSent,
 		redirectChain:     redirectChain,
 		interceptionID:    interceptionID,
 		allowInterception: m.userReqInterceptionEnabled,
+		tagsAndMeta:       tagsAndMeta,
+		networkOperation:  networkOperation,
 	})
 	if err != nil {
 		m.logger.Errorf("NetworkManager", "creating request: %s", err)
@@ -820,7 +891,13 @@ func (m *NetworkManager) onRequest(event *network.EventRequestWillBeSent,
 	m.reqsMu.Lock()
 	m.reqIDToRequest[event.RequestID] = req
 	m.reqsMu.Unlock()
-	m.emitRequestMetrics(req)
+	// Emit the request metrics once the raw headers are resolved, off the
+	// event goroutine so the wait does not block the goroutine that resolves
+	// them. The metric uses req.wallTime, so the deferral does not skew it.
+	m.wg.Go(func() {
+		req.WaitForRawHeaders()
+		m.emitRequestMetrics(req)
+	})
 	m.frameManager.requestStarted(req)
 
 	m.eventInterceptor.onRequest(req)
@@ -849,6 +926,14 @@ func (m *NetworkManager) onRequestWillBeSent(event *network.EventRequestWillBeSe
 	} else {
 		m.onRequest(event, nil)
 	}
+}
+
+func (m *NetworkManager) onRequestWillBeSentExtraInfo(event *network.EventRequestWillBeSentExtraInfo) {
+	extra := parseExtraHeaders(event.Headers)
+	if len(extra) == 0 {
+		return
+	}
+	m.extraInfoTracker.requestWillBeSentExtraInfo(event.RequestID, extra)
 }
 
 // onRequestPaused can send one of these two CDP events:
@@ -997,6 +1082,7 @@ func (m *NetworkManager) onAuthRequired(event *fetch.EventAuthRequired) {
 }
 
 func (m *NetworkManager) onRequestServedFromCache(event *network.EventRequestServedFromCache) {
+	m.extraInfoTracker.requestServedFromCache(event.RequestID)
 	req, ok := m.requestFromID(event.RequestID)
 	if ok {
 		req.setLoadedFromCache(true)
@@ -1010,6 +1096,7 @@ func (m *NetworkManager) onResponseReceived(event *network.EventResponseReceived
 		return
 	}
 	resp := NewHTTPResponse(m.ctx, req, event.Response, event.Timestamp)
+	m.extraInfoTracker.processResponse(event.RequestID, resp, event.HasExtraInfo)
 	req.responseMu.Lock()
 	req.response = resp
 	// Use event.Timestamp for headersEndWall so it shares the same time base as responseEndWall
@@ -1022,6 +1109,14 @@ func (m *NetworkManager) onResponseReceived(event *network.EventResponseReceived
 	m.logger.Debugf("FrameManager:onResponseReceived", "rid:%s rurl:%s", event.RequestID, resp.URL())
 
 	m.eventInterceptor.onResponse(resp)
+}
+
+func (m *NetworkManager) onResponseReceivedExtraInfo(event *network.EventResponseReceivedExtraInfo) {
+	extra := parseExtraHeaders(event.Headers)
+	if len(extra) == 0 {
+		return
+	}
+	m.extraInfoTracker.responseReceivedExtraInfo(event.RequestID, extra)
 }
 
 func (m *NetworkManager) requestFromID(reqID network.RequestID) (*Request, bool) {
@@ -1314,4 +1409,41 @@ func (m *NetworkManager) SetCacheEnabled(enabled bool) {
 
 func (m *NetworkManager) wait() {
 	m.wg.Wait()
+}
+
+func parseExtraHeaders(headers network.Headers) map[string][]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	parsed := make(map[string][]string, len(headers))
+	for name, value := range headers {
+		switch v := value.(type) {
+		case string:
+			parsed[name] = splitHeaderValues(v)
+		case []string:
+			parsed[name] = append([]string{}, v...)
+		case []any:
+			values := make([]string, 0, len(v))
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					values = append(values, s)
+				}
+			}
+			if len(values) > 0 {
+				parsed[name] = values
+			}
+		}
+	}
+	if len(parsed) == 0 {
+		return nil
+	}
+	return parsed
+}
+
+// CDP concatenates duplicate header values with newlines; split to match Playwright.
+func splitHeaderValues(value string) []string {
+	if strings.Contains(value, "\n") {
+		return strings.Split(value, "\n")
+	}
+	return []string{value}
 }

@@ -21,6 +21,7 @@ import (
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/log"
 
 	k6modules "go.k6.io/k6/v2/js/modules"
+	k6metrics "go.k6.io/k6/v2/metrics"
 )
 
 // These ResourceTypes are duplicates of CDP's network.ResourceType. We want to work
@@ -71,16 +72,23 @@ type RequestFailure struct {
 
 // Request represents a browser HTTP request.
 type Request struct {
-	ctx           context.Context
-	frame         *Frame
-	responseMu    sync.RWMutex
-	response      *Response
-	redirectChain []*Request
-	requestID     network.RequestID
-	documentID    string
-	url           *url.URL
-	method        string
-	headers       map[string][]string
+	ctx            context.Context
+	frame          *Frame
+	responseMu     sync.RWMutex
+	response       *Response
+	redirectChain  []*Request
+	requestID      network.RequestID
+	documentID     string
+	url            *url.URL
+	method         string
+	headers        map[string][]string
+	extraHeaders   map[string][]string
+	extraHeadersMu sync.RWMutex
+	// rawHeadersCh is closed once the raw (ExtraInfo) headers have been
+	// resolved: either applied, or known not to arrive. Readers that need the
+	// raw headers wait on it; see waitForRawHeaders.
+	rawHeadersCh   chan struct{}
+	rawHeadersOnce sync.Once
 	// For now we're only going to work with the 0th entry of postDataEntries.
 	// We've not been able to reproduce a situation where more than one entry
 	// occupies the slice. Once we have a better idea of when more than one
@@ -113,6 +121,8 @@ type Request struct {
 	responseEndWall time.Time
 	// encodedDataLength: actual bytes received over the wire (compressed + headers), from LoadingFinished.
 	encodedDataLength int64
+	tagsAndMeta       k6metrics.TagsAndMeta
+	networkOperation  *networkOperationContext
 }
 
 // NewRequestParams are input parameters for NewRequest.
@@ -122,6 +132,8 @@ type NewRequestParams struct {
 	redirectChain     []*Request
 	interceptionID    fetch.RequestID
 	allowInterception bool
+	tagsAndMeta       k6metrics.TagsAndMeta
+	networkOperation  *networkOperationContext
 }
 
 // NewRequest creates a new HTTP request.
@@ -135,8 +147,7 @@ func NewRequest(ctx context.Context, logger *log.Logger, rp NewRequestParams) (*
 
 	u, err := url.Parse(ev.Request.URL)
 	if err != nil {
-		var uerr *url.Error
-		if errors.As(err, &uerr) {
+		if uerr, ok := errors.AsType[*url.Error](err); ok {
 			err = uerr.Err
 		}
 		return nil, fmt.Errorf("parsing URL %q: %w", ev.Request.URL, err)
@@ -176,6 +187,9 @@ func NewRequest(ctx context.Context, logger *log.Logger, rp NewRequestParams) (*
 		documentID:          documentID.String(),
 		headers:             make(map[string][]string, len(ev.Request.Headers)),
 		ctx:                 ctx,
+		rawHeadersCh:        make(chan struct{}),
+		tagsAndMeta:         rp.tagsAndMeta,
+		networkOperation:    rp.networkOperation,
 	}
 	for n, v := range ev.Request.Headers {
 		if s, ok := v.(string); ok {
@@ -221,6 +235,29 @@ func validateResourceType(logger *log.Logger, t string) string {
 	return t
 }
 
+func (r *Request) addExtraHeaders(extra map[string][]string) {
+	r.extraHeadersMu.Lock()
+	r.extraHeaders = extra
+	r.extraHeadersMu.Unlock()
+	r.resolveRawHeaders()
+}
+
+// resolveRawHeaders unblocks readers waiting for the raw (ExtraInfo) headers.
+// It is called once the raw headers have been applied, or once it is known
+// that none will arrive (so the provisional headers are the final ones).
+func (r *Request) resolveRawHeaders() {
+	r.rawHeadersOnce.Do(func() { close(r.rawHeadersCh) })
+}
+
+// WaitForRawHeaders blocks until the raw headers are resolved or the request
+// context is done, whichever comes first.
+func (r *Request) WaitForRawHeaders() {
+	select {
+	case <-r.rawHeadersCh:
+	case <-r.ctx.Done():
+	}
+}
+
 func (r *Request) getFrame() *Frame {
 	return r.frame
 }
@@ -238,9 +275,21 @@ func (r *Request) headersSize() int64 {
 	size += len(r.method)
 	size += len(r.url.Path)
 	size += 8 // httpVersion
-	for n, v := range r.headers {
-		size += len(n) + len(strings.Join(v, "")) + 4 // 4 = ': ' + '\r\n'
+	r.extraHeadersMu.RLock()
+	if len(r.extraHeaders) != 0 {
+		for name, values := range r.extraHeaders {
+			for _, value := range values {
+				size += len(name) + len(value) + 4 // 4 = ': ' + '\r\n'
+			}
+		}
+	} else {
+		for name, values := range r.headers {
+			for _, value := range values {
+				size += len(name) + len(value) + 4 // 4 = ': ' + '\r\n'
+			}
+		}
 	}
+	r.extraHeadersMu.RUnlock()
 	return int64(size)
 }
 
@@ -292,11 +341,18 @@ func (r *Request) setLoadedFromCache(fromMemoryCache bool) {
 
 // AllHeaders returns all the request headers.
 func (r *Request) AllHeaders() map[string]string {
-	// TODO: fix this data to include "ExtraInfo" header data
 	headers := make(map[string]string)
-	for n, v := range r.headers {
-		headers[strings.ToLower(n)] = strings.Join(v, ",")
+	r.extraHeadersMu.RLock()
+	if len(r.extraHeaders) != 0 {
+		for name, values := range r.extraHeaders {
+			headers[strings.ToLower(name)] = strings.Join(values, "\n")
+		}
+	} else {
+		for name, values := range r.headers {
+			headers[strings.ToLower(name)] = strings.Join(values, "\n")
+		}
 	}
+	r.extraHeadersMu.RUnlock()
 	return headers
 }
 
@@ -324,11 +380,17 @@ func (r *Request) Headers() map[string]string {
 // HeadersArray returns the request headers as an array of objects.
 func (r *Request) HeadersArray() []HTTPHeader {
 	headers := make([]HTTPHeader, 0)
-	for n, vals := range r.headers {
-		for _, v := range vals {
-			headers = append(headers, HTTPHeader{Name: n, Value: v})
+	r.extraHeadersMu.RLock()
+	source := r.headers
+	if len(r.extraHeaders) != 0 {
+		source = r.extraHeaders
+	}
+	for name, values := range source {
+		for _, v := range values {
+			headers = append(headers, HTTPHeader{Name: name, Value: v})
 		}
 	}
+	r.extraHeadersMu.RUnlock()
 	return headers
 }
 
@@ -465,6 +527,10 @@ type Response struct {
 	bodyMu            sync.RWMutex
 	body              []byte
 	headers           map[string][]string
+	extraHeaders      map[string][]string
+	extraHeadersMu    sync.RWMutex
+	rawHeadersCh      chan struct{}
+	rawHeadersOnce    sync.Once
 	fromDiskCache     bool
 	fromServiceWorker bool
 	fromPrefetchCache bool
@@ -496,6 +562,7 @@ func NewHTTPResponse(
 		statusText:        resp.StatusText,
 		body:              nil,
 		headers:           make(map[string][]string, len(resp.Headers)),
+		rawHeadersCh:      make(chan struct{}),
 		fromDiskCache:     resp.FromDiskCache,
 		fromServiceWorker: resp.FromServiceWorker,
 		fromPrefetchCache: resp.FromPrefetchCache,
@@ -525,6 +592,29 @@ func NewHTTPResponse(
 	}
 
 	return &r
+}
+
+func (r *Response) addExtraHeaders(extra map[string][]string) {
+	r.extraHeadersMu.Lock()
+	r.extraHeaders = extra
+	r.extraHeadersMu.Unlock()
+	r.resolveRawHeaders()
+}
+
+// resolveRawHeaders unblocks readers waiting for the raw (ExtraInfo) headers.
+// It is called once the raw headers have been applied, or once it is known
+// that none will arrive (so the provisional headers are the final ones).
+func (r *Response) resolveRawHeaders() {
+	r.rawHeadersOnce.Do(func() { close(r.rawHeadersCh) })
+}
+
+// WaitForRawHeaders blocks until the raw headers are resolved or the response
+// context is done, whichever comes first.
+func (r *Response) WaitForRawHeaders() {
+	select {
+	case <-r.rawHeadersCh:
+	case <-r.ctx.Done():
+	}
 }
 
 func (r *Response) fetchBody() error {
@@ -574,20 +664,39 @@ func (r *Response) headersSize() int64 {
 	size += 8 // httpVersion
 	size += 3 // statusCode
 	size += len(r.statusText)
-	for n, v := range r.headers {
-		size += len(n) + len(strings.Join(v, "")) + 4 // 4 = ': ' + '\r\n'
+	r.extraHeadersMu.RLock()
+	if len(r.extraHeaders) != 0 {
+		for name, values := range r.extraHeaders {
+			for _, value := range values {
+				size += len(name) + len(value) + 4 // 4 = ': ' + '\r\n'
+			}
+		}
+	} else {
+		for name, values := range r.headers {
+			for _, value := range values {
+				size += len(name) + len(value) + 4 // 4 = ': ' + '\r\n'
+			}
+		}
 	}
+	r.extraHeadersMu.RUnlock()
 	size += 2 // '\r\n'
 	return int64(size)
 }
 
 // AllHeaders returns all the response headers.
 func (r *Response) AllHeaders() map[string]string {
-	// TODO: fix this data to include "ExtraInfo" header data
 	headers := make(map[string]string)
-	for n, v := range r.headers {
-		headers[strings.ToLower(n)] = strings.Join(v, ",")
+	r.extraHeadersMu.RLock()
+	if len(r.extraHeaders) != 0 {
+		for name, values := range r.extraHeaders {
+			headers[strings.ToLower(name)] = strings.Join(values, "\n")
+		}
+	} else {
+		for name, values := range r.headers {
+			headers[strings.ToLower(name)] = strings.Join(values, "\n")
+		}
 	}
+	r.extraHeadersMu.RUnlock()
 	return headers
 }
 
@@ -637,10 +746,13 @@ func (r *Response) HeaderValue(name string) (string, bool) {
 	return v, ok
 }
 
-// HeaderValues returns the values of the given header.
+// HeaderValues returns the values of the given header. The header name is
+// matched case-insensitively, and headers that carry multiple values (such as
+// Set-Cookie) are returned as separate entries. AllHeaders joins multiple
+// values with a newline, so we split on the same separator here.
 func (r *Response) HeaderValues(name string) []string {
 	headers := r.AllHeaders()
-	return strings.Split(headers[name], ",")
+	return strings.Split(headers[strings.ToLower(name)], "\n")
 }
 
 // FromCache returns whether this response was served from disk cache.
@@ -670,11 +782,17 @@ func (r *Response) Headers() map[string]string {
 // HeadersArray returns the response headers as an array of objects.
 func (r *Response) HeadersArray() []HTTPHeader {
 	headers := make([]HTTPHeader, 0)
-	for n, vals := range r.headers {
-		for _, v := range vals {
-			headers = append(headers, HTTPHeader{Name: n, Value: v})
+	r.extraHeadersMu.RLock()
+	source := r.headers
+	if len(r.extraHeaders) != 0 {
+		source = r.extraHeaders
+	}
+	for name, values := range source {
+		for _, v := range values {
+			headers = append(headers, HTTPHeader{Name: name, Value: v})
 		}
 	}
+	r.extraHeadersMu.RUnlock()
 	return headers
 }
 

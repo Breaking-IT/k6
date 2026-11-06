@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"go.k6.io/k6/v2/cmd/state"
 	"go.k6.io/k6/v2/ext"
 	"go.k6.io/k6/v2/internal/dashboard"
 	"go.k6.io/k6/v2/internal/output/breakingit"
@@ -45,7 +46,7 @@ func getAllOutputConstructors() (map[string]output.Constructor, error) {
 		builtinOutputExperimentalPrometheusRW.String(): func(params output.Params) (output.Output, error) {
 			return remotewrite.New(params)
 		},
-		"web-dashboard":                    dashboard.New,
+		"web-dashboard": dashboard.New,
 		builtinOutputTimescaledbBreakingit.String(): breakingit.New,
 		builtinOutputExperimentalOpentelemetry.String(): func(params output.Params) (output.Output, error) {
 			params.Logger.Warnf("OpenTelemetry output has been graduated as a stable output."+
@@ -72,4 +73,12 @@ func getAllOutputConstructors() (map[string]output.Constructor, error) {
 	}
 
 	return result, nil
+}
+
+// attachCloudLogDrainer gives the cloud output the local-execution log pusher
+// so it flushes buffered logs before the run is notified complete.
+func attachCloudLogDrainer(out output.Output, gs *state.GlobalState) {
+	if co, ok := out.(*cloud.Output); ok && gs.CloudLogPusher != nil {
+		co.SetLogDrainer(gs.CloudLogPusher)
+	}
 }

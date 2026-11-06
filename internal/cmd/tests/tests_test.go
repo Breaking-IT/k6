@@ -35,6 +35,7 @@ func TestRootCommand(t *testing.T) {
 }
 
 func TestCloudLoginNotPanicking(t *testing.T) {
+	requireFullBuild(t)
 	t.Parallel()
 
 	ts := NewGlobalTestState(t)
