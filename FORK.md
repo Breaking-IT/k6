@@ -36,20 +36,20 @@ code to the k6 executable.
 - Restores metric context correctly when native promise settlement re-enters the runtime, preventing
   browser group paths from accumulating across iterations.
 - Excludes upstream's Grafana-specific Renovate approval automation.
-- Restricts inherited release publishing and Windows signing to the upstream repository.
+- Runs lean release builds and fork regression tests on standard Linux GitHub Actions runners.
 
-## Development and builds in jgaalen/k6
+## Development and builds in Breaking-IT/k6
 
 `master` is the default development and build branch, based on upstream k6 v2.3.0. It includes
 the consolidated `breakingit` customizations, native group transactions and browser group-context
 fix. Browser admission control remains reverted. Create feature branches from `origin/master`
-and merge tested pull requests into `master` in jgaalen/k6.
+and merge tested pull requests into `master` in Breaking-IT/k6.
 
 Track stable upstream releases: fetch tags from `upstream`, create an integration branch from
 `origin/master`, and merge the new release tag into that branch. Preserve the fork changes,
-validate normal and lean builds, and open a pull request against jgaalen/k6 `master`. Do not
+validate normal and lean builds, and open a pull request against Breaking-IT/k6 `master`. Do not
 replace the fork branch with upstream history. The `upstream` remote is fetch-only; keep its
-push URL set to `DISABLED` and push only to `origin` (jgaalen/k6).
+push URL set to `DISABLED` and push only to `origin` (Breaking-IT/k6).
 
 ```sh
 git switch master
