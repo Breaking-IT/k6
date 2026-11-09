@@ -745,9 +745,24 @@ func (l *Logger) processBrowserError(s metrics.Sample, ts int64) {
 		}
 		l.mu.Lock()
 		if screenshotHash != "" {
-			l.pendingScreenshots = append(l.pendingScreenshots, []any{
-				screenshotHash, screenshot, "image/png", len(screenshot),
-			})
+			if l.rowSink != nil {
+				// BreakTest DB keeps the screenshot in the run, next to the error row
+				// that references it; there is no separate screenshot store.
+				if len(screenshot) > dbScreenshotBytes {
+					_, _ = fmt.Fprintf(l.out, "[screenshot] dropped: %d bytes exceeds the BreakTest DB batch bound\n", len(screenshot))
+					row[14] = ""
+				} else {
+					_ = l.rowSink("browser_screenshots", []string{
+						time.Unix(0, ts).UTC().Format(time.RFC3339Nano),
+						fmt.Sprintf("%v", l.envTags["run_id"]),
+						screenshotHash, "image/png", screenshot,
+					})
+				}
+			} else {
+				l.pendingScreenshots = append(l.pendingScreenshots, []any{
+					screenshotHash, screenshot, "image/png", len(screenshot),
+				})
+			}
 		}
 		l.writeRow(l.bufErrors, row)
 		l.mu.Unlock()

@@ -98,10 +98,15 @@ this observation; this is not a claim that Chromium's original event clock is
 watermarked. Nothing is retimestamped at output delivery to hide writer backlog.
 Uninstrumented request metric producers fail closed.
 
-Synthetic monitoring and browser screenshots are explicitly unsupported and
-rejected. Ordinary browser request timings, failure response data, native groups
-and browser error messages are supported. An unexpected screenshot-bearing error
-also fails the output, rather than storing a dangling screenshot reference.
+Synthetic monitoring is explicitly unsupported and rejected. Ordinary browser
+request timings, failure response data, native groups and browser error messages
+are supported. With `K6_BROWSER_SCREENSHOT_ON_ERROR=true`, each browser error's
+screenshot is written to the run's `browser_screenshots` stream (time, run_id,
+SHA-256 hash, MIME type, base64 PNG) just before the error row whose
+`response_data` holds that hash; a large screenshot may close the current batch
+and travel in the batch before its error row. A screenshot larger than 7 MiB of base64 cannot
+fit the storage batch bound; it is dropped and the error row carries no
+reference, so no reference ever dangles.
 
 ## Validation
 
