@@ -79,9 +79,6 @@ func NewBreakTestDB(params output.Params) (output.Output, error) {
 	if strings.EqualFold(env["syntheticMonitoring"], "true") {
 		return nil, errors.New("BreakTest DB k6 output does not support synthetic monitoring")
 	}
-	if strings.EqualFold(env["K6_BROWSER_SCREENSHOT_ON_ERROR"], "true") {
-		return nil, errors.New("BreakTest DB k6 output does not yet support browser screenshot storage")
-	}
 	tokens := strings.Split(token, ",")
 	seen := map[string]bool{}
 	if len(tokens) > 4 {
@@ -225,12 +222,6 @@ func (c *BreakTestDBOutput) AddMetricSamples(samples []metrics.SampleContainer) 
 			ticket = tracked.RequestTicket()
 		}
 		for _, sample := range sc.GetSamples() {
-			if sample.Metric.Name == "browser_errors" && sample.Tags.Map()["screenshot"] != "" {
-				c.fail(errors.New("browser screenshots require a BreakTest DB payload integration"))
-				return
-			}
-		}
-		for _, sample := range sc.GetSamples() {
 			key := httpMetricCanonicalKey(sample.Metric.Name)
 			if key == "" {
 				requestMetric := strings.HasPrefix(sample.Metric.Name, "custom_") || sample.Metric.Name == "ws_connecting" || sample.Metric.Name == "ws_ping"
@@ -351,7 +342,7 @@ func (c *BreakTestDBOutput) enqueueLocked() error {
 	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	for _, table := range []string{"requests_raw", "transactions", "requests_error", "virtual_users"} {
+	for _, table := range []string{"requests_raw", "transactions", "requests_error", "virtual_users", "browser_screenshots"} {
 		data := c.parts[table]
 		if data == nil {
 			continue

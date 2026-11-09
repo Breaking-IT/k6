@@ -204,7 +204,7 @@ func TestBreakTestDBFailureForbidsFinish(t *testing.T) {
 
 func TestBreakTestDBConfigurationAndBounds(t *testing.T) {
 	t.Parallel()
-	for _, entry := range []struct{ k, v string }{{"syntheticMonitoring", "true"}, {"K6_BROWSER_SCREENSHOT_ON_ERROR", "true"}, {"runId", "../wrong"}, {"BREAKTEST_DB_TOKEN", ""}, {"BREAKINGIT_TRANSACTION_SOURCE", "wrong"}} {
+	for _, entry := range []struct{ k, v string }{{"syntheticMonitoring", "true"}, {"runId", "../wrong"}, {"BREAKTEST_DB_TOKEN", ""}, {"BREAKINGIT_TRANSACTION_SOURCE", "wrong"}} {
 		env := map[string]string{"runId": "test", "BREAKTEST_DB_TOKEN": "token"}
 		env[entry.k] = entry.v
 		_, err := NewBreakTestDB(output.Params{ConfigArgument: "http://localhost", Environment: env})
@@ -469,4 +469,49 @@ func TestBreakTestDBFullBatchRespectsStorageDecoderWindow(t *testing.T) {
 	decoded, err := decoder.DecodeAll(encoded, nil)
 	require.NoError(t, err)
 	require.Equal(t, plain, decoded)
+}
+
+func TestBreakTestDBStoresBrowserScreenshotsWithTheirErrors(t *testing.T) {
+	t.Parallel()
+	c := newBreakTestDBTest(t, "http://localhost")
+	rows := map[string][][]string{}
+	c.mapper.rowSink = func(table string, row []string) error {
+		rows[table] = append(rows[table], row)
+		return nil
+	}
+	reg := metrics.NewRegistry()
+	shot := strings.Repeat("iVBORw0KGgo", 300000) // ~3.3 MB, above the 2 MiB row bound of other tables
+	tags := reg.RootTagSet().With("error", "element not found").With("screenshot", shot)
+	c.AddMetricSamples([]metrics.SampleContainer{metrics.Sample{TimeSeries: metrics.TimeSeries{Metric: reg.MustNewMetric("browser_errors", metrics.Counter), Tags: tags}, Time: time.Now(), Value: 1}})
+	require.NoError(t, c.err())
+	require.Len(t, rows["browser_screenshots"], 1)
+	require.Len(t, rows["requests_error"], 1)
+	stored := rows["browser_screenshots"][0]
+	require.Equal(t, "run-123", stored[1])
+	require.Equal(t, rows["requests_error"][0][14], stored[2], "the error row references the stored screenshot")
+	require.Equal(t, "image/png", stored[3])
+	require.Equal(t, shot, stored[4])
+	_, err := encodeDBRow("browser_screenshots", stored)
+	require.NoError(t, err)
+	require.Empty(t, c.mapper.pendingScreenshots)
+
+	huge := reg.RootTagSet().With("error", "too big").With("screenshot", strings.Repeat("A", dbScreenshotBytes+1))
+	c.AddMetricSamples([]metrics.SampleContainer{metrics.Sample{TimeSeries: metrics.TimeSeries{Metric: reg.MustNewMetric("browser_errors", metrics.Counter), Tags: huge}, Time: time.Now(), Value: 1}})
+	require.NoError(t, c.err())
+	require.Len(t, rows["browser_screenshots"], 1)
+	require.Len(t, rows["requests_error"], 2)
+	require.Empty(t, rows["requests_error"][1][14], "no dangling reference for a dropped screenshot")
+}
+
+func TestBreakTestDBBatchCarriesBrowserScreenshots(t *testing.T) {
+	t.Parallel()
+	c := newBreakTestDBTest(t, "http://localhost")
+	require.NoError(t, c.addRow("browser_screenshots", []string{"2026-10-30T00:00:00Z", "run-123", "abc", "image/png", strings.Repeat("Q", 3*1024*1024)}))
+	c.flush()
+	batch := <-c.queue
+	encoder, err := zstd.NewWriter(nil)
+	require.NoError(t, err)
+	tables := decodeDBBatch(t, encoder.EncodeAll(batch.body, nil), batch.contentType)
+	require.Len(t, tables["browser_screenshots"], 1)
+	require.Equal(t, "abc", string(tables["browser_screenshots"][0][2]))
 }

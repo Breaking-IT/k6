@@ -20,7 +20,14 @@ var customSchemas = map[string]string{
 	"transactions":   "tsssbiii",
 	"requests_error": "tssssssiissssssu",
 	"virtual_users":  "tsssiii",
+	// time, run_id, screenshot_hash, mime_type, data (base64 PNG)
+	"browser_screenshots": "tssss",
 }
+
+// Largest base64 screenshot stored in BreakTest DB. A batch holding one must
+// stay within the storage service's 8 MiB compressed / 32 MiB decoded batch
+// transport bound; base64 PNG barely compresses, so this keeps a margin.
+const dbScreenshotBytes = 7 * 1024 * 1024
 
 func encodeDBRow(table string, row []string) ([]byte, error) {
 	schema := customSchemas[table]
@@ -32,7 +39,11 @@ func encodeDBRow(table string, row []string) ([]byte, error) {
 	for _, s := range row {
 		size += len(s)
 	}
-	if size > dbBatchBytes-1024 {
+	limit := dbBatchBytes - 1024
+	if table == "browser_screenshots" {
+		limit = dbScreenshotBytes + 4096
+	}
+	if size > limit {
 		return nil, fmt.Errorf("%s row exceeds BreakTest DB batch budget", table)
 	}
 	b := bytes.NewBuffer(make([]byte, 0, size))
